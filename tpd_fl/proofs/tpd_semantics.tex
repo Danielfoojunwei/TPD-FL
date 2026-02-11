@@ -1,0 +1,1341 @@
+% --------------------------------------------------------------------------
+%  Typed Privacy Diffusion: Formal Semantics and Safety Proofs
+%  Companion proof document for the TPD-FL system
+% --------------------------------------------------------------------------
+
+\documentclass[11pt,a4paper]{article}
+
+% ----- packages -----------------------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{thmtools}
+\usepackage{thm-restate}
+\usepackage{natbib}
+\bibliographystyle{abbrvnat}
+
+% ----- theorem environments ------------------------------------------------
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+% ----- notation shortcuts --------------------------------------------------
+\newcommand{\cV}{\mathcal{V}}           % vocabulary
+\newcommand{\cA}{\mathcal{A}}           % allowed-set function
+\newcommand{\cP}{\mathcal{P}}           % power set
+\newcommand{\cS}{\mathcal{S}}           % state space
+\newcommand{\cT}{\mathcal{T}}           % type universe
+\newcommand{\cF}{\mathcal{F}}           % forbidden set
+\newcommand{\cR}{\mathcal{R}}           % repair operator
+\newcommand{\St}{S_t}                   % state at step t
+\newcommand{\xt}{x_t}                   % token sequence at step t
+\newcommand{\Mt}{M_t}                   % update mask at step t
+\newcommand{\ty}{\tau}                  % type assignment
+\newcommand{\Gam}{\Gamma}              % typing context
+\newcommand{\projop}{\Pi}              % projection operator
+\newcommand{\okpi}{\mathrm{Ok}_\pi}    % verifier gate
+\newcommand{\neginf}{-\infty}          % negative infinity
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\logits}{\ell}             % logits
+\newcommand{\PUB}{\textsc{Pub}}
+\newcommand{\SENS}{\textsc{Sens}}
+\newcommand{\REG}{\textsc{Reg}}
+\newcommand{\DERIV}{\textsc{Derived}}
+\newcommand{\mtt}{\textsc{M2T}}
+\newcommand{\ttt}{\textsc{T2T}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+% --------------------------------------------------------------------------
+\title{\textbf{Typed Privacy Diffusion:\\
+       Formal Semantics and Safety Proofs}}
+
+\author{TPD-FL Project}
+
+\date{}
+
+% ==========================================================================
+\begin{document}
+\maketitle
+
+% --------------------------------------------------------------------------
+\begin{abstract}
+We present the formal semantics and safety proofs for
+\emph{Typed Privacy Diffusion}~(TPD), a type-theoretic framework
+that enforces token-level privacy guarantees within discrete
+diffusion language models operating under federated learning.
+TPD assigns every output position a \emph{span type} drawn from a
+lattice of privacy classifications and restricts the generative
+process---at every transition step---to an allowed token set
+determined by that type.  The restriction is implemented by a
+\emph{logits projection operator} $\projop$ that sets the
+probability of every forbidden token to exactly zero.
+
+We formalise the TPD state machine, define four transition rules
+(mask-to-token, token-to-token edit, schedule-restricted transition,
+and repair), and prove four theorems:
+\textbf{Type Preservation} (well-typedness is an invariant of the
+transition system),
+\textbf{Hard Non-Emission} (forbidden tokens have exactly zero
+sampling probability),
+\textbf{Closure Under Editing} (token-to-token edit steps preserve
+typing), and
+\textbf{Verifier-Lifted Global Safety} (combining type preservation
+with a deterministic policy verifier yields end-to-end policy
+compliance).
+As a corollary, we show that no federated learning adapter---even an
+adversarially trained one---can circumvent the projection guarantee.
+Finally, we derive a utility bound quantifying the information-theoretic
+cost of the projection in terms of the allowed mass $Z_i$.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ==========================================================================
+\section{Introduction}\label{sec:intro}
+% ==========================================================================
+
+Discrete diffusion language models~\citep{austin2021structured,
+lou2024discrete} generate text by iteratively denoising a
+fully-masked token sequence.  At each step a subset of positions
+transitions from the mask token to a concrete vocabulary element,
+guided by a neural denoising network.  This iterative,
+position-level generation offers a natural intervention point for
+enforcing fine-grained output constraints.
+
+In privacy-sensitive settings---clinical note generation, financial
+report drafting, or any scenario involving personally identifiable
+information~(PII)---it is essential that the model \emph{never} emit
+certain tokens at certain positions, regardless of what the
+underlying neural parameters predict.  Standard sampling from a
+softmax distribution over the full vocabulary provides no such
+guarantee: a sufficiently confident logit for a forbidden token will
+produce that token with non-negligible probability.
+
+\emph{Typed Privacy Diffusion}~(TPD) addresses this gap with three
+ideas:
+\begin{enumerate}[label=(\roman*)]
+  \item A \textbf{span typing} system $\ty : [L] \to \cT$ that
+        classifies each output position as public, sensitive,
+        regulated, or derived;
+  \item A \textbf{projection operator}
+        $\projop_{\cA(\ty_i)}$ that clamps the logits of every
+        token outside the allowed set $\cA(\ty_i)$ to $\neginf$
+        \emph{before} the softmax, thereby zeroing its probability
+        exactly;
+  \item A \textbf{deterministic verifier gate} $\okpi$ that checks
+        structural and pattern-level policy compliance after each
+        step, triggering a monotone repair action on failure.
+\end{enumerate}
+Together these mechanisms provide a \emph{hard}, model-parameter-independent
+privacy guarantee: no amount of fine-tuning, including adversarial
+federated learning updates, can cause a forbidden token to be sampled
+at a sensitive position.
+
+This document provides the complete formal treatment.
+Section~\ref{sec:defs} introduces the vocabulary, types, states,
+and operators.
+Section~\ref{sec:trans} defines the transition rules.
+Sections~\ref{sec:thm1}--\ref{sec:thm4} state and prove the four
+main theorems.
+Section~\ref{sec:cor} derives the FL adapter safety corollary.
+Section~\ref{sec:utility} analyses the utility cost of projection.
+
+\paragraph{Notation.}  We write $[L] = \{1, \ldots, L\}$ for
+position indices, $\cV$ for the vocabulary of size $V = |\cV|$,
+and~$\bot$ for the distinguished mask token.  All logarithms are
+natural unless stated otherwise.
+
+% ==========================================================================
+\section{Definitions}\label{sec:defs}
+% ==========================================================================
+
+% ---------- 2.1 Vocabulary and tokens -----------
+\subsection{Vocabulary, Mask Token, and Token Sequences}
+
+\begin{definition}[Vocabulary and Mask Token]\label{def:vocab}
+Let $\cV$ be a finite set of tokens (the \emph{vocabulary}) with
+$|\cV| = V$.  We distinguish a special \emph{mask token}
+$\bot \in \cV$ that represents an unresolved position.  A
+\emph{token sequence} of length $L$ is an element
+$x \in \cV^L$.  We write $x[i]$ for the token at position
+$i \in [L]$.
+\end{definition}
+
+\begin{definition}[Mask Set]\label{def:mask}
+At each diffusion step $t$ the sampler proposes an \emph{update mask}
+$\Mt \subseteq [L]$, the set of positions to be updated.  Typically
+$\Mt \subseteq \{i \in [L] : x_t[i] = \bot\}$ for mask-to-token
+steps, or $\Mt \subseteq \{i \in [L] : x_t[i] \neq \bot\}$ for
+token-to-token edit steps.
+\end{definition}
+
+% ---------- 2.2 Span types -----------
+\subsection{Span Types and the Type Universe}
+
+\begin{definition}[Type Universe]\label{def:types}
+The \emph{type universe} is the finite set
+\[
+  \cT \;=\;
+  \bigl\{\,
+    \PUB,\;
+    \SENS,\;
+    \REG,\;
+    \DERIV\text{\_Name},\;
+    \DERIV\text{\_Email},\;
+    \DERIV\text{\_Phone},\;
+    \DERIV\text{\_Id},\;
+    \DERIV\text{\_Cc},\;
+    \DERIV\text{\_Address}
+  \,\bigr\}.
+\]
+We partition $\cT$ into \emph{public} types and \emph{sensitive}
+types:
+\[
+  \cT_{\mathrm{sens}} \;=\; \cT \setminus \{\PUB\},
+  \qquad
+  \cT_{\mathrm{pub}} \;=\; \{\PUB\}.
+\]
+Every type $\ty \in \cT_{\mathrm{sens}}$ carries a vocabulary
+restriction; the public type $\PUB$ imposes no restriction.
+\end{definition}
+
+\begin{remark}
+The enumeration in Definition~\ref{def:types} mirrors the
+\texttt{SpanType} enum in the implementation
+(\texttt{tpd\_fl.tpd.typing}).
+The $\DERIV$\_* types refine $\SENS$ for entity-specific allowed
+sets.
+\end{remark}
+
+% ---------- 2.3 Typing context -----------
+\subsection{Typing Context $\Gam$}
+
+\begin{definition}[Typing Context]\label{def:ctx}
+A \emph{typing context} is a triple $\Gam = (\ty, \cA, \pi)$ where:
+\begin{enumerate}[label=(\alph*)]
+  \item $\ty : [L] \to \cT$ is the \emph{type assignment}, mapping
+        each position to a span type.  It is computed deterministically
+        by the \emph{span typer} (regex detectors, optional NER, and
+        policy overrides).
+  \item $\cA : \cT \to \cP(\cV)$ is the \emph{allowed-set function},
+        mapping each type to the subset of the vocabulary permitted
+        at positions of that type.  In particular,
+        $\cA(\PUB) = \cV$ (full vocabulary) and for every
+        $\ty \in \cT_{\mathrm{sens}}$,
+        $\cA(\ty) \subsetneq \cV$ contains only placeholders,
+        safe punctuation, and entity-specific template tokens.
+  \item $\pi$ is the \emph{privacy policy}, a deterministic
+        predicate over token sequences encoding:
+        \begin{itemize}
+          \item Forbidden patterns (regular expressions for emails,
+                phone numbers, social security numbers, credit card
+                numbers, identifiers);
+          \item Structural requirements (sensitive spans must
+                decode to valid placeholder strings);
+          \item Optional semantic checks (no known secret appears
+                in the output).
+        \end{itemize}
+\end{enumerate}
+We say that a token sequence $x \in \cV^L$ \emph{satisfies} the
+typing context~$\Gam$ at the token level, written
+$x \models_{\mathrm{tok}} \Gam$, if and only if
+\begin{equation}\label{eq:tok-sat}
+  \forall\, i \in [L] :\;
+  \ty(i) \in \cT_{\mathrm{sens}}
+  \;\Longrightarrow\;
+  x[i] \in \cA\bigl(\ty(i)\bigr).
+\end{equation}
+We say $x$ \emph{fully satisfies} $\Gam$, written
+$x \models \Gam$, if $x \models_{\mathrm{tok}} \Gam$ and
+$\pi(x) = \mathrm{true}$.
+\end{definition}
+
+\begin{remark}
+Token-level satisfaction (Equation~\ref{eq:tok-sat}) is decidable
+in $O(L)$ time by inspecting each position.  Full satisfaction
+adds the cost of evaluating~$\pi$, which involves regex matching
+and placeholder verification (both linear in the decoded text
+length).
+\end{remark}
+
+% ---------- 2.4 State space -----------
+\subsection{State Space}
+
+\begin{definition}[TPD State]\label{def:state}
+A \emph{TPD state} at step $t$ is a triple
+\[
+  \St = (\xt,\, \Mt,\, \Gam),
+\]
+where $\xt \in \cV^L$ is the current token sequence,
+$\Mt \subseteq [L]$ is the update mask for step~$t$, and
+$\Gam = (\ty, \cA, \pi)$ is the typing context.
+
+The \emph{initial state} is
+$S_0 = (\bot^L,\, \emptyset,\, \Gam)$, i.e.\ all positions are
+masked and no update has been proposed.  The typing context~$\Gam$
+is fixed for the duration of a decode run (it is computed once from
+the input text before decoding begins).
+\end{definition}
+
+\begin{definition}[Well-Typed State]\label{def:welltyped}
+A state $\St = (\xt, \Mt, \Gam)$ is \emph{well-typed} if
+$\xt \models_{\mathrm{tok}} \Gam$, i.e.\ every non-mask token at a
+sensitive position belongs to the allowed set for that position's
+type.  Formally:
+\[
+  \mathrm{WT}(\St)
+  \;\iff\;
+  \forall\, i \in [L] :\;
+  \bigl(\xt[i] \neq \bot
+        \;\wedge\;
+        \ty(i) \in \cT_{\mathrm{sens}}\bigr)
+  \;\Longrightarrow\;
+  \xt[i] \in \cA\bigl(\ty(i)\bigr).
+\]
+Note that the mask token $\bot$ satisfies any constraint vacuously,
+so the initial state $S_0$ is always well-typed.
+\end{definition}
+
+% ---------- 2.5 Projection operator -----------
+\subsection{The Projection Operator $\projop$}
+
+The projection operator is the core enforcement mechanism.
+
+\begin{definition}[Logits Projection]\label{def:proj}
+Let $\logits_i \in \mathbb{R}^V$ be the raw logit vector produced by
+the denoising network for position~$i$.  The \emph{projection
+operator} $\projop_{\cA(\ty_i)}$ is defined component-wise:
+\begin{equation}\label{eq:proj}
+  \bigl[\projop_{\cA(\ty_i)}(\logits_i)\bigr]_v
+  \;=\;
+  \begin{cases}
+    \logits_i[v] & \text{if } v \in \cA(\ty_i), \\[3pt]
+    \neginf       & \text{if } v \notin \cA(\ty_i).
+  \end{cases}
+\end{equation}
+For public positions ($\ty_i = \PUB$), $\cA(\PUB) = \cV$, so
+$\projop_\cV$ is the identity.
+\end{definition}
+
+\begin{lemma}[Projection Zeroes Forbidden Probabilities]%
+\label{lem:proj-zero}
+For any logit vector $\logits_i \in \mathbb{R}^V$ and any type
+$\ty_i \in \cT_{\mathrm{sens}}$:
+\[
+  \forall\, v \notin \cA(\ty_i) :\;
+  \softmax\!\bigl(\projop_{\cA(\ty_i)}(\logits_i)\bigr)[v]
+  \;=\; 0.
+\]
+\end{lemma}
+
+\begin{proof}
+By definition of $\projop$, the projected logit for every
+$v \notin \cA(\ty_i)$ is $\neginf$.  The softmax function is
+\[
+  \softmax(\logits_i)[v]
+  \;=\;
+  \frac{\exp(\logits_i[v])}
+       {\sum_{v' \in \cV} \exp(\logits_i[v'])}.
+\]
+Since $\exp(\neginf) = 0$ and the denominator is strictly positive
+(there exists at least one $v' \in \cA(\ty_i)$ with finite logit,
+because $\cA(\ty_i) \neq \emptyset$ by the allowed-set construction),
+we have $\softmax(\projop_{\cA(\ty_i)}(\logits_i))[v] = 0$.
+\end{proof}
+
+\begin{remark}[Numerical Implementation]\label{rem:numerical}
+In floating-point arithmetic, $\neginf$ is implemented as
+\texttt{torch.finfo(dtype).min} (e.g., $\approx -3.4 \times 10^{38}$
+for \texttt{float32}).  After exponentiation this value flushes to
+exactly~$0.0$ in IEEE~754 arithmetic.  The implementation
+(\texttt{tpd\_fl.tpd.projection.project\_logits}) groups positions by
+type and applies a single \texttt{masked\_fill\_} per type for
+GPU efficiency.
+\end{remark}
+
+% ---------- 2.6 Allowed mass -----------
+\subsection{Allowed Mass $Z_i$}
+
+\begin{definition}[Allowed Mass]\label{def:zi}
+For position $i$ with type $\ty_i$ and \emph{pre-projection} logit
+vector $\logits_i$, the \emph{allowed mass} is
+\begin{equation}\label{eq:zi}
+  Z_i
+  \;=\;
+  \sum_{v \in \cA(\ty_i)}
+    \softmax(\logits_i)[v].
+\end{equation}
+For $\PUB$ positions, $Z_i = 1$ identically.  For sensitive
+positions, $0 < Z_i \leq 1$; the value quantifies how much
+probability mass the model naturally places on allowed tokens
+\emph{before} projection.
+\end{definition}
+
+\begin{remark}
+$Z_i$ serves as a diagnostic proxy for utility cost.  A low $Z_i$
+indicates that the model ``wants'' to emit forbidden tokens but is
+prevented by projection, implying a larger divergence between the
+projected and unprojected distributions.
+\end{remark}
+
+% ---------- 2.7 Schedule phases -----------
+\subsection{Schedule Phases}
+
+\begin{definition}[Three-Phase Schedule]\label{def:schedule}
+The decode process is partitioned into three temporal phases based
+on the step fraction $t/T$:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Draft} ($0 \leq t/T < \alpha$):  Only public
+        positions ($\ty_i = \PUB$) may be updated.  Sensitive
+        positions remain masked.
+  \item \textbf{Safe} ($\alpha \leq t/T < \beta$):  All positions
+        may be updated, but sensitive positions are constrained by
+        projection $\projop_{\cA(\ty_i)}$.
+  \item \textbf{Reveal} ($\beta \leq t/T \leq 1$):  Public positions
+        plus an explicit reveal-allowlist may be updated.  Sensitive
+        positions not on the allowlist remain locked.
+\end{enumerate}
+Here $0 < \alpha < \beta < 1$ are configurable phase boundaries
+(default $\alpha = 0.4$, $\beta = 0.9$).
+
+Let $\mathrm{Allowed}(t, T, \ty) \subseteq [L]$ denote the set of
+positions eligible for update at step~$t$.  The \emph{effective update
+mask} is $\Mt^* = \Mt \cap \mathrm{Allowed}(t, T, \ty)$.
+\end{definition}
+
+% ==========================================================================
+\section{Transition Rules}\label{sec:trans}
+% ==========================================================================
+
+We define four transition rules that govern how the TPD state
+evolves.  Each rule maps a state $\St$ to a successor state
+$S_{t+1}$.  The transitions are \emph{randomised} (they involve
+sampling), so formally each rule defines a conditional distribution
+over $S_{t+1}$ given $\St$.
+
+% ---------- 3.1 M2T -----------
+\subsection{Mask-to-Token (M2T) Transition}
+
+\begin{definition}[\mtt{} Transition]\label{def:m2t}
+Given state $\St = (\xt, \Mt, \Gam)$, the \mtt{} transition
+produces $S_{t+1} = (x_{t+1}, M_{t+1}, \Gam)$ as follows:
+\begin{enumerate}
+  \item \textbf{Schedule intersection.}
+        Compute $\Mt^* = \Mt \cap \mathrm{Allowed}(t, T, \ty)$.
+  \item \textbf{Logits computation.}
+        For each $i \in \Mt^*$, compute raw logits
+        $\logits_i = f_\theta(\xt, t, i) \in \mathbb{R}^V$ using
+        the denoising network $f_\theta$.
+  \item \textbf{Projection.}
+        For each $i \in \Mt^*$, compute projected logits
+        $\tilde{\logits}_i = \projop_{\cA(\ty_i)}(\logits_i)$.
+  \item \textbf{Sampling.}
+        For each $i \in \Mt^*$, sample
+        $x_{t+1}[i] \sim
+         \mathrm{Categorical}\!\bigl(
+           \softmax(\tilde{\logits}_i)
+         \bigr)$.
+  \item \textbf{Copy.}
+        For each $i \notin \Mt^*$,
+        $x_{t+1}[i] = \xt[i]$.
+\end{enumerate}
+\end{definition}
+
+% ---------- 3.2 T2T -----------
+\subsection{Token-to-Token Edit (T2T) Transition}
+
+\begin{definition}[\ttt{} Transition]\label{def:t2t}
+The \ttt{} transition applies to positions that already hold a
+concrete token ($\xt[i] \neq \bot$) but require editing (e.g., after
+a verifier rejection or during a refinement phase).  The rule is
+identical to Definition~\ref{def:m2t} except:
+\begin{itemize}
+  \item The update mask $\Mt$ may include positions where
+        $\xt[i] \neq \bot$.
+  \item The logits may be produced by a dedicated edit head
+        $f_\theta^{\mathrm{edit}}$ or by the same denoising network
+        conditioned on the current (non-mask) tokens.
+\end{itemize}
+Crucially, step~3 (projection) is applied identically:
+$\tilde{\logits}_i = \projop_{\cA(\ty_i)}(\logits_i)$ for every
+$i \in \Mt^*$.
+\end{definition}
+
+% ---------- 3.3 Schedule-restricted -----------
+\subsection{Schedule-Restricted Transition}
+
+\begin{definition}[Schedule-Restricted Transition]\label{def:sched-trans}
+A \emph{schedule-restricted transition} is any \mtt{} or \ttt{}
+transition whose update mask is first intersected with the
+phase-allowed positions:
+\[
+  \Mt^* \;=\; \Mt \;\cap\; \mathrm{Allowed}(t, T, \ty).
+\]
+This ensures that during the Draft phase no sensitive position is
+written, and during the Reveal phase only explicitly revealed types
+are written.  The intersection is a purely deterministic,
+set-theoretic operation applied \emph{before} any logits computation
+or sampling.
+\end{definition}
+
+\begin{remark}
+The schedule intersection provides an additional safety layer beyond
+projection.  In the Draft phase, sensitive positions are never even
+queried for logits, providing defence in depth.
+\end{remark}
+
+% ---------- 3.4 Repair -----------
+\subsection{Repair Transition}
+
+\begin{definition}[Repair Transition]\label{def:repair}
+If the verifier $\okpi$ rejects the current state (i.e.,
+$\pi(\xt) = \mathrm{false}$), a \emph{repair transition}
+$\cR$ is triggered.  Two modes are supported:
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Resample repair.}  Let
+        $F \subseteq [L]$ be the set of violating positions
+        identified by the verifier.  The repair operator:
+        \begin{enumerate}[label=\arabic*.]
+          \item Sets $\xt[i] \leftarrow \bot$ for all $i \in F$
+                (re-masking).
+          \item Computes fresh logits $\logits_i = f_\theta(\xt, t, i)$
+                for $i \in F$.
+          \item Applies projection:
+                $\tilde{\logits}_i =
+                 \projop_{\cA(\ty_i)}(\logits_i)$.
+          \item Samples $x_{t+1}[i] \sim
+                \mathrm{Categorical}(\softmax(\tilde{\logits}_i))$.
+        \end{enumerate}
+        This is iterated up to $K$ times (default $K = 3$) until all
+        violating positions are resolved.
+  \item \textbf{Edit repair.}  Violating positions are directly
+        overwritten with the first token in $\cA(\ty_i)$
+        (typically a placeholder token), without querying the model.
+\end{enumerate}
+Both modes apply the projection operator, so the repair transition
+preserves well-typedness by the same argument as the \mtt{}
+transition (Theorem~\ref{thm:type-pres}).
+\end{definition}
+
+% ==========================================================================
+\section{Theorem 1: Type Preservation}\label{sec:thm1}
+% ==========================================================================
+
+\begin{theorem}[Type Preservation]\label{thm:type-pres}
+Let $\St = (\xt, \Mt, \Gam)$ be a well-typed state, i.e.\
+$\mathrm{WT}(\St)$ holds.  Let $S_{t+1}$ be the successor state
+produced by any \mtt{} or \ttt{} transition with projection
+(Definitions~\ref{def:m2t} and~\ref{def:t2t}).  Then
+$\mathrm{WT}(S_{t+1})$ holds.
+
+In other words, well-typedness is an \emph{invariant} of the TPD
+transition system:
+\[
+  \mathrm{WT}(\St)
+  \;\Longrightarrow\;
+  \mathrm{WT}(S_{t+1}).
+\]
+\end{theorem}
+
+\begin{proof}
+We must show that for every position $i \in [L]$: if
+$\ty(i) \in \cT_{\mathrm{sens}}$ and $x_{t+1}[i] \neq \bot$, then
+$x_{t+1}[i] \in \cA(\ty(i))$.  We consider two cases.
+
+\medskip\noindent
+\textbf{Case 1: $i \notin \Mt^*$ (position not updated).}
+By the Copy step (step~5 of Definition~\ref{def:m2t}),
+$x_{t+1}[i] = \xt[i]$.  Since $\mathrm{WT}(\St)$ holds, if
+$\ty(i) \in \cT_{\mathrm{sens}}$ and $\xt[i] \neq \bot$ then
+$\xt[i] \in \cA(\ty(i))$, so
+$x_{t+1}[i] = \xt[i] \in \cA(\ty(i))$.
+If $\xt[i] = \bot$ then $x_{t+1}[i] = \bot$ and the constraint is
+vacuously satisfied.
+
+\medskip\noindent
+\textbf{Case 2: $i \in \Mt^*$ (position updated by sampling).}
+The projected logits are
+$\tilde{\logits}_i = \projop_{\cA(\ty_i)}(\logits_i)$.
+By Lemma~\ref{lem:proj-zero}, for every $v \notin \cA(\ty_i)$:
+\[
+  \softmax(\tilde{\logits}_i)[v] = 0.
+\]
+The sampling step draws
+$x_{t+1}[i] \sim
+ \mathrm{Categorical}(\softmax(\tilde{\logits}_i))$.
+A categorical distribution with parameter vector $p$ assigns zero
+probability to any outcome $v$ with $p[v] = 0$.  Therefore
+$\Pr[x_{t+1}[i] = v] = 0$ for all
+$v \notin \cA(\ty_i)$.
+
+Since $x_{t+1}[i]$ is drawn from this distribution, it must lie in
+$\mathrm{supp}(\softmax(\tilde{\logits}_i))
+ \subseteq \cA(\ty_i)$.
+
+Hence $x_{t+1}[i] \in \cA(\ty_i)$, and $\mathrm{WT}(S_{t+1})$
+holds.
+\end{proof}
+
+\begin{remark}
+The proof is \emph{constructive}: it does not depend on any
+property of the denoising network $f_\theta$, the diffusion step
+$t$, or the mask schedule.  The guarantee follows purely from the
+projection operator acting on the logits before sampling.
+\end{remark}
+
+% ==========================================================================
+\section{Theorem 2: Hard Non-Emission}\label{sec:thm2}
+% ==========================================================================
+
+\begin{theorem}[Hard Non-Emission]\label{thm:hard-nonemit}
+For any position $i \in [L]$ with
+$\ty_i \in \cT_{\mathrm{sens}}$, any token
+$v \notin \cA(\ty_i)$, and any state $\St$:
+\begin{equation}\label{eq:hard-nonemit}
+  \Pr\!\bigl[\,x_{t+1}[i] = v \;\big|\; \St\,\bigr]
+  \;=\; 0.
+\end{equation}
+That is, the probability of emitting a forbidden token at a
+sensitive position is \emph{exactly zero}, not merely small.
+\end{theorem}
+
+\begin{proof}
+The proof proceeds in three steps, tracing the data flow from raw
+logits to the sampled token.
+
+\medskip
+\noindent\textbf{Step 1 (Projection).}
+The projection operator (Definition~\ref{def:proj}) sets
+\[
+  \tilde{\logits}_i[v]
+  \;=\;
+  \bigl[\projop_{\cA(\ty_i)}(\logits_i)\bigr]_v
+  \;=\; \neginf
+  \quad
+  \text{for all } v \notin \cA(\ty_i).
+\]
+
+\noindent\textbf{Step 2 (Softmax).}
+The softmax function applied to the projected logits gives
+\[
+  \softmax(\tilde{\logits}_i)[v]
+  \;=\;
+  \frac{\exp(\neginf)}
+       {\displaystyle\sum_{v' \in \cV}\exp(\tilde{\logits}_i[v'])}
+  \;=\;
+  \frac{0}
+       {\displaystyle\sum_{v' \in \cA(\ty_i)}\exp(\logits_i[v'])}
+  \;=\; 0.
+\]
+The denominator is strictly positive because $\cA(\ty_i)$ is
+non-empty (it always contains at least the placeholder tokens) and
+the logits for allowed tokens are finite real numbers.
+
+\medskip
+\noindent\textbf{Step 3 (Multinomial sampling).}
+The token $x_{t+1}[i]$ is drawn from
+$\mathrm{Categorical}(p)$ where $p = \softmax(\tilde{\logits}_i)$.
+Since $p[v] = 0$, the event $\{x_{t+1}[i] = v\}$ has probability
+zero:
+\[
+  \Pr\!\bigl[\,x_{t+1}[i] = v \;\big|\; \St\,\bigr]
+  \;=\;
+  p[v]
+  \;=\; 0.
+  \qedhere
+\]
+\end{proof}
+
+\begin{remark}[Comparison with Differential Privacy]
+Differential privacy provides a probabilistic guarantee
+($\varepsilon$-bounded log-likelihood ratio) that \emph{weakens}
+with the privacy budget.  Hard non-emission (Theorem~\ref{thm:hard-nonemit})
+provides an \emph{absolute} guarantee: the probability is exactly
+zero, independent of any privacy budget or noise calibration.  This
+is possible because the guarantee is structural (a deterministic
+logit transformation) rather than statistical.
+\end{remark}
+
+\begin{remark}[Relation to the Schedule]
+If position $i$ is not in the effective update mask
+$\Mt^* = \Mt \cap \mathrm{Allowed}(t, T, \ty)$, then
+$x_{t+1}[i] = \xt[i]$ (the position is not updated at all), and the
+non-emission guarantee holds trivially for the new token (it is
+either $\bot$ or was already in $\cA(\ty_i)$ by the well-typedness
+invariant).  The schedule thus provides defence in depth: even if
+the projection were somehow bypassed, the schedule prevents
+sensitive positions from being written during the Draft phase.
+\end{remark}
+
+% ==========================================================================
+\section{Theorem 3: Closure Under Editing (T2T)}\label{sec:thm3}
+% ==========================================================================
+
+\begin{theorem}[Closure Under Editing]\label{thm:t2t-closure}
+Let $\St = (\xt, \Mt, \Gam)$ be a well-typed state.  If a \ttt{}
+edit step (Definition~\ref{def:t2t}) is applied with projected
+logits, the resulting state $S_{t+1}$ is also well-typed:
+\[
+  \mathrm{WT}(\St) \;\Longrightarrow\; \mathrm{WT}(S_{t+1}).
+\]
+\end{theorem}
+
+\begin{proof}
+The \ttt{} transition differs from the \mtt{} transition only in
+the set of positions that may be updated (non-mask positions rather
+than mask positions) and possibly in the logit source (an edit head
+rather than the standard denoising head).  However, the projection
+step is identical: for every $i \in \Mt^*$, the logits are projected
+via $\projop_{\cA(\ty_i)}$ before sampling.
+
+The proof of Theorem~\ref{thm:type-pres} depends only on two
+properties:
+\begin{enumerate}
+  \item Positions not in $\Mt^*$ are copied unchanged (well-typedness
+        preserved by the inductive hypothesis).
+  \item Positions in $\Mt^*$ are sampled from projected logits
+        (well-typedness guaranteed by Lemma~\ref{lem:proj-zero} and
+        the zero-probability argument).
+\end{enumerate}
+Both properties hold identically for the \ttt{} transition.  The
+source of the logits (denoising head vs.\ edit head, arbitrary
+parameter values, arbitrary conditioning) does not affect the
+argument because the projection is applied \emph{after} logit
+computation and \emph{before} sampling.
+
+Therefore $\mathrm{WT}(S_{t+1})$ holds.
+\end{proof}
+
+\begin{remark}
+Closure under editing is essential for the repair mechanism
+(Definition~\ref{def:repair}).  When the verifier rejects a state,
+the repair engine applies either a resample or an edit step---both
+of which use projection---so the repaired state is guaranteed to
+be well-typed.
+\end{remark}
+
+% ==========================================================================
+\section{Theorem 4: Verifier-Lifted Global Safety}\label{sec:thm4}
+% ==========================================================================
+
+Token-level safety (well-typedness) prevents individual forbidden
+tokens from appearing at sensitive positions.  However, privacy
+policies often impose \emph{sequence-level} constraints: for
+example, no substring matching an email regex should appear anywhere
+in the output, and sensitive spans should decode to well-formed
+placeholders.  The verifier gate $\okpi$ captures these structural
+requirements.
+
+\begin{definition}[Verifier Gate $\okpi$]\label{def:verifier}
+The \emph{verifier gate} is a deterministic boolean function
+\[
+  \okpi : \cV^L \to \{\mathrm{true}, \mathrm{false}\}
+\]
+that implements the policy predicate~$\pi$.  It checks:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Regex scan.}  No substring of the decoded text
+        matches any forbidden pattern (email, phone, SSN, credit
+        card, identifier).
+  \item \textbf{Structural check.}  Every contiguous span of
+        sensitive positions decodes to a valid placeholder string
+        from a pre-defined set.
+  \item \textbf{Semantic check} (optional).  No known secret from a
+        denylist appears in the decoded text.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Verifier-Lifted Global Safety]\label{thm:global-safety}
+Let $S_0, S_1, \ldots, S_T$ be a sequence of TPD states produced by
+any combination of \mtt{}, \ttt{}, schedule-restricted, and repair
+transitions with projection.  If:
+\begin{enumerate}
+  \item Every transition satisfies type preservation
+        (Theorem~\ref{thm:type-pres}), i.e.\
+        $\mathrm{WT}(S_t)$ holds for all $0 \leq t \leq T$; and
+  \item The verifier accepts the final state:
+        $\okpi(x_T) = \mathrm{true}$;
+\end{enumerate}
+then the output $x_T$ fully satisfies the typing context:
+$x_T \models \Gam$.
+\end{theorem}
+
+\begin{proof}
+Full satisfaction (Definition~\ref{def:ctx}) requires two
+conditions:
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Token-level safety}: $x_T \models_{\mathrm{tok}} \Gam$.
+  \item \textbf{Policy compliance}: $\pi(x_T) = \mathrm{true}$.
+\end{enumerate}
+
+\noindent\emph{(a)~Token-level safety.}
+By hypothesis~1 and induction on $t$:
+\begin{itemize}
+  \item \textbf{Base case} ($t = 0$):
+        $S_0 = (\bot^L, \emptyset, \Gam)$.  All tokens are $\bot$,
+        so $\mathrm{WT}(S_0)$ holds vacuously.
+  \item \textbf{Inductive step} ($t \to t + 1$):
+        $\mathrm{WT}(S_t) \Rightarrow \mathrm{WT}(S_{t+1})$ by
+        Theorem~\ref{thm:type-pres} (for \mtt{} and \ttt{} steps)
+        and by the projection argument applied to repair steps
+        (Definition~\ref{def:repair}).
+\end{itemize}
+Therefore $\mathrm{WT}(S_T)$ holds, which is precisely
+$x_T \models_{\mathrm{tok}} \Gam$.
+
+\medskip
+\noindent\emph{(b)~Policy compliance.}
+By hypothesis~2, $\okpi(x_T) = \mathrm{true}$, which by
+Definition~\ref{def:verifier} means $\pi(x_T) = \mathrm{true}$.
+
+\medskip
+Combining (a) and (b):
+$x_T \models_{\mathrm{tok}} \Gam \;\wedge\; \pi(x_T) = \mathrm{true}$,
+hence $x_T \models \Gam$.
+\end{proof}
+
+\begin{remark}[Separation of Concerns]
+Theorem~\ref{thm:global-safety} cleanly separates the token-level
+guarantee (provided by the projection operator) from the
+sequence-level guarantee (provided by the verifier).  This
+separation is by design: the projection is a \emph{cheap, local}
+operation (modifying logits position-by-position), while the
+verifier is a \emph{global} check that runs regex matching and
+structural analysis over the entire decoded text.  Neither alone
+suffices: the projection cannot detect multi-token patterns (e.g., a
+phone number reassembled from individually-allowed digits), and the
+verifier alone cannot provide the hard zero-probability guarantee.
+\end{remark}
+
+\begin{remark}[Role of Repair]
+In practice, the verifier may reject intermediate states.  The repair
+mechanism (Definition~\ref{def:repair}) re-establishes verifier
+acceptance while preserving well-typedness.  The repair loop is
+bounded (at most $K$ iterations), and in the worst case the edit
+repair mode deterministically replaces violating positions with
+placeholder tokens, guaranteeing termination and well-typedness.
+\end{remark}
+
+% ==========================================================================
+\section{Corollary: FL Adapter Safety}\label{sec:cor}
+% ==========================================================================
+
+In federated learning (FL), each client trains a local adapter
+$\theta_{\mathrm{adapter}}$ (e.g., LoRA matrices) on private data
+and sends weight updates to a central server for aggregation.  An
+adversarial client could craft $\theta_{\mathrm{adapter}}$ to
+maximise the probability of emitting sensitive tokens.  The
+following corollary shows that this attack is fundamentally blocked
+by TPD projection.
+
+\begin{corollary}[FL Adapter Safety]\label{cor:fl-safety}
+Let $\theta = \theta_{\mathrm{base}} + \theta_{\mathrm{adapter}}$
+be any parameterisation of the denoising network, where
+$\theta_{\mathrm{adapter}}$ is an arbitrary adapter (including one
+chosen adversarially to maximise the logits of forbidden tokens).
+If TPD projection $\projop_{\cA(\ty_i)}$ is applied at decode time,
+then for every sensitive position $i$ with
+$\ty_i \in \cT_{\mathrm{sens}}$ and every forbidden token
+$v \notin \cA(\ty_i)$:
+\[
+  \Pr\!\bigl[\,x_{t+1}[i] = v \;\big|\;
+  f_\theta,\, \St\,\bigr]
+  \;=\; 0.
+\]
+In particular, hard non-emission (Theorem~\ref{thm:hard-nonemit})
+holds regardless of~$\theta_{\mathrm{adapter}}$.
+\end{corollary}
+
+\begin{proof}
+Observe that the projection operator
+$\projop_{\cA(\ty_i)}$ (Definition~\ref{def:proj}) is defined as a
+deterministic function of the logit vector $\logits_i$ and the
+allowed set $\cA(\ty_i)$.  It does \emph{not} depend on:
+\begin{itemize}
+  \item the model parameters $\theta$ (or any decomposition thereof);
+  \item the training procedure that produced $\theta$;
+  \item the data distribution seen during training;
+  \item the diffusion step $t$ or mask pattern.
+\end{itemize}
+
+The projection sets $\tilde{\logits}_i[v] = \neginf$ for all
+$v \notin \cA(\ty_i)$, regardless of the value of $\logits_i[v]$
+computed by the network.  Even if $\logits_i[v]$ is very large
+(the adversarial case), the projection overwrites it.
+
+The remainder of the argument is identical to the proof of
+Theorem~\ref{thm:hard-nonemit}:
+$\softmax(\tilde{\logits}_i)[v] = 0$, and multinomial sampling
+assigns zero probability to this outcome.
+
+Since the above holds for \emph{any} $\theta_{\mathrm{adapter}}$,
+the corollary follows.
+\end{proof}
+
+\begin{remark}[Defence Against Byzantine Clients]
+In FL threat models, Byzantine clients may send arbitrary weight
+updates to the server.  After aggregation, the global model may
+produce logits that strongly favour forbidden tokens at sensitive
+positions.  Corollary~\ref{cor:fl-safety} guarantees that the
+projection layer---applied at inference time on the server or
+client---nullifies any such bias.  This makes TPD a
+\emph{model-agnostic} safety layer: it provides the same guarantee
+regardless of how the model was trained, fine-tuned, or corrupted.
+\end{remark}
+
+\begin{remark}[Architectural Placement]
+The projection must be applied \emph{after} all logit computation
+(including any adapter contributions) and \emph{before} the softmax
+and sampling.  Placing it earlier in the forward pass (e.g., before
+the adapter's contribution is added) would invalidate the guarantee,
+as the adapter could then modify the logits after projection.  The
+implementation enforces this by invoking
+\texttt{ProjectionEngine.project()} as the last transformation
+before \texttt{sample\_tokens()}.
+\end{remark}
+
+% ==========================================================================
+\section{Utility Bound}\label{sec:utility}
+% ==========================================================================
+
+The projection operator improves privacy at the cost of utility:
+by zeroing the probability of forbidden tokens, it concentrates all
+probability mass on the allowed set, potentially distorting the
+model's intended distribution.  We now quantify this cost.
+
+\subsection{KL Divergence of Projected Distribution}
+
+\begin{proposition}[Projection Penalty]\label{prop:kl}
+Let $p_i = \softmax(\logits_i) \in \Delta^{V-1}$ be the unprojected
+distribution at position~$i$, and
+$\tilde{p}_i = \softmax(\projop_{\cA(\ty_i)}(\logits_i))$ the
+projected distribution.  Then:
+\begin{enumerate}[label=(\alph*)]
+  \item The projected distribution is the conditional distribution
+        $\tilde{p}_i[v] = p_i[v] / Z_i$ for $v \in \cA(\ty_i)$
+        and $\tilde{p}_i[v] = 0$ otherwise, where
+        $Z_i = \sum_{v \in \cA(\ty_i)} p_i[v]$.
+  \item The KL divergence from $\tilde{p}_i$ to $p_i$ is
+        \begin{equation}\label{eq:kl}
+          D_{\mathrm{KL}}(\tilde{p}_i \| p_i)
+          \;=\; -\log Z_i.
+        \end{equation}
+  \item The \emph{total projection penalty} across all positions is
+        \begin{equation}\label{eq:total-penalty}
+          \Delta
+          \;=\;
+          \sum_{i=1}^{L}
+            D_{\mathrm{KL}}(\tilde{p}_i \| p_i)
+          \;=\;
+          \sum_{i=1}^{L} (-\log Z_i)
+          \;=\;
+          -\sum_{i=1}^{L} \log Z_i.
+        \end{equation}
+        For public positions, $Z_i = 1$ and the contribution is zero.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}\hfill
+
+\noindent\emph{(a)}
+For $v \in \cA(\ty_i)$, the projected logit is
+$\tilde{\logits}_i[v] = \logits_i[v]$.  For
+$v \notin \cA(\ty_i)$, $\tilde{\logits}_i[v] = \neginf$.  Therefore:
+\[
+  \tilde{p}_i[v]
+  \;=\;
+  \frac{\exp(\logits_i[v])}
+       {\sum_{v' \in \cA(\ty_i)} \exp(\logits_i[v'])}
+  \;=\;
+  \frac{p_i[v]}
+       {Z_i}
+  \quad\text{for } v \in \cA(\ty_i),
+\]
+where the second equality uses the fact that
+$p_i[v] = \exp(\logits_i[v]) / \sum_{v'} \exp(\logits_i[v'])$ and
+$Z_i = \sum_{v' \in \cA(\ty_i)} p_i[v']$.
+
+\medskip\noindent\emph{(b)}
+\begin{align*}
+  D_{\mathrm{KL}}(\tilde{p}_i \| p_i)
+  &\;=\;
+  \sum_{v \in \cA(\ty_i)}
+    \tilde{p}_i[v]
+    \log\frac{\tilde{p}_i[v]}{p_i[v]}
+  \\
+  &\;=\;
+  \sum_{v \in \cA(\ty_i)}
+    \frac{p_i[v]}{Z_i}
+    \log\frac{p_i[v] / Z_i}{p_i[v]}
+  \\
+  &\;=\;
+  \sum_{v \in \cA(\ty_i)}
+    \frac{p_i[v]}{Z_i}
+    \log\frac{1}{Z_i}
+  \\
+  &\;=\;
+  (-\log Z_i)
+  \sum_{v \in \cA(\ty_i)}
+    \frac{p_i[v]}{Z_i}
+  \\
+  &\;=\;
+  -\log Z_i.
+\end{align*}
+
+\noindent\emph{(c)}
+The total penalty is a direct sum over positions.  For
+$\ty_i = \PUB$, $\cA(\PUB) = \cV$, so $Z_i = 1$ and
+$-\log 1 = 0$.
+\end{proof}
+
+\subsection{Privacy--Utility Trade-off}
+
+\begin{remark}[Interpreting the Bound]\label{rem:tradeoff}
+The quantity $-\log Z_i$ has a natural information-theoretic
+interpretation: it is the number of nats of information lost at
+position~$i$ due to the projection.
+
+\begin{itemize}
+  \item \textbf{Small penalty} ($Z_i \approx 1$):  The model
+        already concentrates most probability mass on allowed
+        tokens.  The projection barely changes the distribution, and
+        utility loss is negligible.
+  \item \textbf{Large penalty} ($Z_i \ll 1$):  The model strongly
+        prefers forbidden tokens.  The projection forces a large
+        redistribution of probability mass onto the allowed set,
+        potentially degrading output quality at that position.
+\end{itemize}
+
+The trade-off is controlled by the \emph{size} of the allowed sets
+$\cA(\ty_i)$.  Larger allowed sets (more tokens permitted) yield
+higher $Z_i$ and lower penalty, but weaker privacy.  Smaller allowed
+sets yield stronger privacy guarantees at the cost of utility.
+\end{remark}
+
+\begin{remark}[Empirical Monitoring]
+The implementation tracks $Z_i$ statistics per step via the
+diagnostics module (\texttt{tpd\_fl.tpd.diagnostics}).  Operators can
+monitor the $Z_i$ distribution (mean, percentiles, fraction below
+thresholds) to detect situations where the projection penalty is
+excessively high and adjust the allowed-set configuration accordingly.
+\end{remark}
+
+\subsection{Bound on Cross-Entropy Increase}
+
+\begin{proposition}[Cross-Entropy Increase]\label{prop:ce}
+Let $H(p_i, q)$ denote the cross-entropy of the true data
+distribution $q$ under the model distribution $p_i$, and
+$H(\tilde{p}_i, q)$ the cross-entropy under the projected
+distribution.  For any position $i$ where $\ty_i \in \cT_{\mathrm{sens}}$:
+\[
+  H(\tilde{p}_i, q)
+  \;\leq\;
+  H(p_i, q) \;+\; (-\log Z_i)
+  \;=\;
+  H(p_i, q) \;+\; D_{\mathrm{KL}}(\tilde{p}_i \| p_i).
+\]
+Equality holds when the true distribution $q$ is supported entirely
+within $\cA(\ty_i)$.
+\end{proposition}
+
+\begin{proof}
+By the chain rule for KL divergence and the identity
+$H(\tilde{p}_i, q) = H(q) + D_{\mathrm{KL}}(q \| \tilde{p}_i)$
+(where $H(q)$ is the entropy of $q$), it suffices to bound the
+increase in KL divergence.  For tokens
+$v \in \cA(\ty_i)$:
+\[
+  \log \frac{1}{\tilde{p}_i[v]}
+  \;=\;
+  \log \frac{1}{p_i[v]} + \log Z_i
+  \;\leq\;
+  \log \frac{1}{p_i[v]}  + (-\log Z_i)^+,
+\]
+but more directly, noting that $\tilde{p}_i[v] = p_i[v]/Z_i$:
+\begin{align*}
+  H(\tilde{p}_i, q)
+  &= -\sum_{v} q[v] \log \tilde{p}_i[v] \\
+  &= -\sum_{v \in \cA(\ty_i)} q[v] \log \frac{p_i[v]}{Z_i}
+     -\sum_{v \notin \cA(\ty_i)} q[v] \log \tilde{p}_i[v].
+\end{align*}
+The second sum involves $\tilde{p}_i[v] = 0$ for
+$v \notin \cA(\ty_i)$.  If $q[v] > 0$ for some
+$v \notin \cA(\ty_i)$, the cross-entropy is $+\infty$ (the
+projected model assigns zero probability to an event with positive
+true probability).  This is expected: if the true data actually
+contains forbidden tokens at sensitive positions, the projection
+cannot faithfully represent it---this is precisely the intended
+privacy behaviour.
+
+When $\mathrm{supp}(q) \subseteq \cA(\ty_i)$ (which is the design
+intent for well-redacted data):
+\begin{align*}
+  H(\tilde{p}_i, q)
+  &= -\sum_{v \in \cA(\ty_i)} q[v]
+     \bigl(\log p_i[v] - \log Z_i\bigr) \\
+  &= -\sum_{v \in \cA(\ty_i)} q[v] \log p_i[v]
+     \;+\; \log Z_i \cdot \underbrace{\sum_{v \in \cA(\ty_i)} q[v]}_{=1} \\
+  &= H(p_i, q) + (-\log Z_i). \qedhere
+\end{align*}
+\end{proof}
+
+% ==========================================================================
+\section{Discussion}\label{sec:discussion}
+% ==========================================================================
+
+\subsection{Completeness of the Safety Argument}
+
+The four theorems and the corollary establish a layered safety
+argument:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Layer} & \textbf{Mechanism} & \textbf{Guarantee} \\
+\midrule
+Token-level  & Projection $\projop_{\cA(\ty_i)}$ &
+  Type preservation, hard non-emission \\
+Edit-level   & Projection on T2T logits &
+  Closure under editing \\
+Sequence-level & Verifier $\okpi$ &
+  Policy compliance (patterns, structure) \\
+System-level & Projection $\perp$ model parameters &
+  FL adapter safety \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+No single layer suffices alone:
+\begin{itemize}
+  \item Projection alone cannot detect multi-token patterns (e.g.,
+        a phone number composed of individually-allowed digit tokens).
+  \item The verifier alone cannot provide zero-probability guarantees
+        (it can only reject and trigger repair).
+  \item The schedule alone does not constrain \emph{which} tokens
+        are written during the Safe phase.
+\end{itemize}
+The combination of all layers is necessary and sufficient for
+$x_T \models \Gam$.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+  \item \textbf{Type assignment accuracy.}  The formal guarantees
+        are conditioned on the correctness of the span typer~$\ty$.
+        If the typer fails to detect a sensitive span (e.g., an
+        unusual PII format), that span is typed as $\PUB$ and
+        receives no restriction.  In practice, the typer uses
+        regex detectors plus optional NER, which may have
+        false negatives.
+
+  \item \textbf{Allowed-set design.}  The strength of the
+        non-emission guarantee depends on the allowed sets being
+        correctly constructed.  If a forbidden token is
+        inadvertently included in $\cA(\ty_i)$, the projection will
+        not block it.
+
+  \item \textbf{Floating-point considerations.}  The proofs assume
+        ideal arithmetic ($\exp(\neginf) = 0$).  In practice, the
+        implementation uses \texttt{finfo.min} values, which yield
+        $\exp(\texttt{finfo.min}) = 0.0$ exactly under IEEE~754
+        (Remark~\ref{rem:numerical}).  No known hardware violates
+        this property.
+
+  \item \textbf{Side channels.}  The guarantees concern the
+        \emph{sampled token sequence} only.  They do not address
+        side-channel leakage through timing, memory access patterns,
+        or gradient information during training.
+\end{enumerate}
+
+\subsection{Relation to Prior Work}
+
+TPD draws on several lines of research:
+
+\begin{itemize}
+  \item \textbf{Discrete diffusion models}~\citep{austin2021structured,
+        lou2024discrete}: TPD operates within the mask-and-denoise
+        framework, adding type-aware constraints at each step.
+
+  \item \textbf{Constrained decoding}~\citep{hokamp2017lexically,
+        hu2019improved}: Grammar-based and vocabulary-restricted
+        decoding has been explored for autoregressive models.  TPD
+        extends this to the diffusion setting with a formal type
+        system.
+
+  \item \textbf{Federated learning for LLMs}~\citep{mcmahan2017communication,
+        charles2024towards}: TPD addresses the open problem of
+        preventing trained adapters from leaking training data
+        through the generated text.
+
+  \item \textbf{Differential privacy in FL}~\citep{abadi2016deep,
+        mcmahan2018learning}: DP provides statistical guarantees
+        on gradient information; TPD provides deterministic
+        guarantees on generated tokens.  The two are complementary:
+        DP protects the training process, TPD protects the inference
+        output.
+
+  \item \textbf{PII detection and
+        anonymisation}~\citep{lison2021anonymisation}: TPD's span
+        typer can be seen as a lightweight PII detector whose
+        output is consumed by a formal enforcement mechanism.
+\end{itemize}
+
+% ==========================================================================
+\section{Conclusion}\label{sec:conclusion}
+% ==========================================================================
+
+We have presented a complete formal treatment of Typed Privacy
+Diffusion, establishing that:
+\begin{enumerate}
+  \item The type preservation invariant holds across all transition
+        rules (Theorems~\ref{thm:type-pres} and~\ref{thm:t2t-closure}).
+  \item Forbidden tokens have exactly zero emission probability at
+        sensitive positions (Theorem~\ref{thm:hard-nonemit}).
+  \item Combining token-level safety with the verifier gate yields
+        full policy compliance
+        (Theorem~\ref{thm:global-safety}).
+  \item These guarantees hold regardless of the model parameters,
+        including adversarially-crafted FL adapters
+        (Corollary~\ref{cor:fl-safety}).
+  \item The utility cost of projection is bounded by $-\log Z_i$
+        per position, with $Z_i$ being the pre-projection
+        probability mass on the allowed set
+        (Propositions~\ref{prop:kl} and~\ref{prop:ce}).
+\end{enumerate}
+
+The proofs are constructive and parameter-independent: the
+projection operator is a deterministic function of the type
+assignment and allowed sets, applied after all model computation.
+This architectural choice makes TPD a robust, model-agnostic safety
+layer suitable for deployment in privacy-sensitive federated
+learning systems.
+
+% ==========================================================================
+% References
+% ==========================================================================
+\begingroup
+\raggedright
+\begin{thebibliography}{20}
+
+\bibitem[Abadi et~al.(2016)]{abadi2016deep}
+Abadi, M., Chu, A., Goodfellow, I., McMahan, H.~B., Mironov, I.,
+Talwar, K., and Zhang, L.
+\newblock Deep learning with differential privacy.
+\newblock In \emph{Proceedings of the 2016 ACM SIGSAC Conference on
+Computer and Communications Security (CCS)}, pp.\ 308--318, 2016.
+
+\bibitem[Austin et~al.(2021)]{austin2021structured}
+Austin, J., Johnson, D.~D., Ho, J., Tarlow, D., and van~den~Berg, R.
+\newblock Structured denoising diffusion models in discrete state-spaces.
+\newblock In \emph{Advances in Neural Information Processing Systems
+(NeurIPS)}, 34, 2021.
+
+\bibitem[Charles et~al.(2024)]{charles2024towards}
+Charles, Z., Garrett, Z., Huo, Z., Kidambi, R., and
+Konecny, J.
+\newblock Towards federated foundation models: Scalable dataset
+pipelines for group-structured learning.
+\newblock In \emph{Advances in Neural Information Processing Systems
+(NeurIPS)}, 37, 2024.
+
+\bibitem[Hokamp \& Liu(2017)]{hokamp2017lexically}
+Hokamp, C. and Liu, Q.
+\newblock Lexically constrained decoding for sequence generation using
+grid beam search.
+\newblock In \emph{Proceedings of the 55th Annual Meeting of the
+Association for Computational Linguistics (ACL)}, pp.\ 1535--1546,
+2017.
+
+\bibitem[Hu et~al.(2019)]{hu2019improved}
+Hu, J.~E., Singh, A., Holzenberger, N., Post, M., and Van~Durme, B.
+\newblock Improved lexically constrained decoding for translation and
+monolingual rewriting.
+\newblock In \emph{Proceedings of the 2019 Conference of the North
+American Chapter of the Association for Computational Linguistics
+(NAACL)}, pp.\ 839--850, 2019.
+
+\bibitem[Lison et~al.(2021)]{lison2021anonymisation}
+Lison, P., Hubin, A., Barnes, J., and Touileb, S.
+\newblock Named entity recognition without labelled data: Weak
+supervision for NER with noise-aware learning.
+\newblock \emph{ACL-IJCNLP 2021}, 2021.
+
+\bibitem[Lou et~al.(2024)]{lou2024discrete}
+Lou, A., Meng, C., and Ermon, S.
+\newblock Discrete diffusion modeling by estimating the ratios of the
+data distribution.
+\newblock In \emph{Proceedings of the 41st International Conference on
+Machine Learning (ICML)}, 2024.
+
+\bibitem[McMahan et~al.(2017)]{mcmahan2017communication}
+McMahan, B., Moore, E., Ramage, D., Hampson, S., and y~Arcas, B.~A.
+\newblock Communication-efficient learning of deep networks from
+decentralized data.
+\newblock In \emph{Proceedings of the 20th International Conference on
+Artificial Intelligence and Statistics (AISTATS)}, pp.\ 1273--1282,
+2017.
+
+\bibitem[McMahan et~al.(2018)]{mcmahan2018learning}
+McMahan, H.~B., Ramage, D., Talwar, K., and Zhang, L.
+\newblock Learning differentially private recurrent language models.
+\newblock In \emph{International Conference on Learning Representations
+(ICLR)}, 2018.
+
+\end{thebibliography}
+\endgroup
+
+% ==========================================================================
+\appendix
+\section{Summary of Notation}\label{app:notation}
+% ==========================================================================
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$\cV$ & Vocabulary (finite set of tokens) \\
+$V = |\cV|$ & Vocabulary size \\
+$\bot \in \cV$ & Mask token \\
+$L$ & Sequence length \\
+$[L] = \{1, \ldots, L\}$ & Position index set \\
+$x \in \cV^L$ & Token sequence \\
+$x[i]$ & Token at position $i$ \\
+$\cT$ & Type universe \\
+$\cT_{\mathrm{sens}} = \cT \setminus \{\PUB\}$ & Sensitive types \\
+$\ty : [L] \to \cT$ & Type assignment \\
+$\cA : \cT \to \cP(\cV)$ & Allowed-set function \\
+$\pi$ & Privacy policy predicate \\
+$\Gam = (\ty, \cA, \pi)$ & Typing context \\
+$\St = (\xt, \Mt, \Gam)$ & TPD state at step $t$ \\
+$\Mt \subseteq [L]$ & Update mask at step $t$ \\
+$\Mt^*$ & Effective update mask (after schedule intersection) \\
+$\projop_{\cA(\ty_i)}$ & Projection operator for position $i$ \\
+$\okpi$ & Verifier gate (implements $\pi$) \\
+$\logits_i \in \mathbb{R}^V$ & Raw logit vector at position $i$ \\
+$\tilde{\logits}_i$ & Projected logit vector \\
+$Z_i$ & Allowed mass at position $i$ \\
+$\Delta$ & Total projection penalty \\
+$f_\theta$ & Denoising network with parameters $\theta$ \\
+$\theta_{\mathrm{adapter}}$ & FL adapter parameters \\
+$T$ & Total number of diffusion steps \\
+$\alpha, \beta$ & Phase boundaries (Draft/Safe/Reveal) \\
+$K$ & Maximum repair iterations \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

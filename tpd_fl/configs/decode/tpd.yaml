@@ -1,0 +1,50 @@
+# TPD Diffusion Decode Configuration
+# Usage: python -m tpd_fl.diffusion.decode_loop --config configs/decode/tpd.yaml
+
+# Model backend
+model_backend: "synthetic"   # "synthetic" | "hf" | "llada"
+model_name_or_path: ""
+vocab_size: 32000
+mask_token_id: 0
+synthetic_mode: "uniform"
+
+# Diffusion parameters
+total_steps: 64
+seq_len: 128
+tokens_per_step_frac: 0.15
+
+# Sampling
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+seed: 42
+
+# TPD Schedule
+schedule_draft_end: 0.4
+schedule_safe_end: 0.9
+schedule_selection: "random"
+
+# TPD Projection
+projection_enabled: true
+
+# TPD Verifier
+verifier_enabled: true
+verifier_check_every: 1
+verifier_forbidden_tags:
+  - EMAIL
+  - PHONE
+  - SSN
+  - CC
+  - ID
+
+# TPD Repair
+repair_enabled: true
+repair_mode: "resample"
+repair_max_iters: 3
+
+# Diagnostics
+diagnostics_enabled: true
+output_dir: "runs/decode"
+
+# Input
+input_text: "Please contact John Smith at john.smith@company.com or call 555-123-4567. His SSN is 123-45-6789."

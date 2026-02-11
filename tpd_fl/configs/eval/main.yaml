@@ -1,0 +1,52 @@
+# Evaluation Suite Configuration
+# Usage: python -m tpd_fl.eval.run_eval --config configs/eval/main.yaml
+
+# Model
+model_backend: "synthetic"
+vocab_size: 32000
+mask_token_id: 0
+
+# Decode parameters
+total_steps: 64
+seq_len: 128
+temperature: 1.0
+seed: 42
+
+# Baselines to run (B0–B7)
+baselines:
+  - "B0_unprotected"
+  - "B1_posthoc_redaction"
+  - "B2_ar_logit_mask"
+  - "B3_tpd_projection_only"
+  - "B4_tpd_projection_schedule"
+  - "B5_tpd_schedule_repair"
+  - "B6_tpd_fl"
+  # - "B7_tpd_fl_typed"  # optional
+
+# Benchmark
+num_samples: 50
+adversarial_fraction: 0.3
+secret_formats:
+  - "email"
+  - "phone"
+  - "ssn"
+  - "name"
+
+# Metrics
+compute_rouge: false  # requires optional dep
+leakage_patterns:
+  - EMAIL
+  - PHONE
+  - SSN
+  - CC
+  - ID
+
+# FL configuration (for B6/B7)
+fl_num_rounds: 5
+fl_num_clients: 3
+fl_lora_rank: 8
+
+# Output
+output_dir: "runs/eval"
+save_plots: true
+save_per_sample: true

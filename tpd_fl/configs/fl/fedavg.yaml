@@ -1,0 +1,35 @@
+# Federated Learning Configuration — FedAvg
+# Usage: python -m tpd_fl.fl.server --config configs/fl/fedavg.yaml
+
+# Server
+num_rounds: 10
+min_clients: 3
+strategy: "fedavg"
+
+# Model
+model_backend: "synthetic"
+vocab_size: 32000
+mask_token_id: 0
+
+# LoRA
+lora_rank: 8
+lora_alpha: 16.0
+lora_dropout: 0.0
+
+# Client training
+local_epochs: 3
+learning_rate: 0.001
+batch_size: 4
+typed_training: false
+
+# Data
+num_clients: 5
+domain_skew: 0.8
+seed: 42
+
+# TPD (applied during evaluation, not training)
+projection_enabled: true
+verifier_enabled: true
+
+# Output
+output_dir: "runs/fl_fedavg"

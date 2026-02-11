@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "tpd-fl"
+version = "0.1.0"
+description = "Typed Privacy Diffusion + Federated Learning for Diffusion Language Models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "TPD-FL Research Team"},
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+hf = [
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist",
+]
+all = [
+    "tpd-fl[hf,dev]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tpd_fl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tpd_fl/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --tb=short"
+
+[tool.setuptools.package-data]
+tpd_fl = ["configs/**/*.yaml"]
