@@ -1,0 +1,23 @@
+# Baseline: Diffusion decode WITHOUT TPD protection
+# Usage: python -m tpd_fl.diffusion.decode_loop --config configs/decode/no_tpd.yaml
+
+model_backend: "synthetic"
+vocab_size: 32000
+mask_token_id: 0
+synthetic_mode: "uniform"
+
+total_steps: 64
+seq_len: 128
+tokens_per_step_frac: 0.15
+
+temperature: 1.0
+seed: 42
+
+# All TPD features disabled
+projection_enabled: false
+verifier_enabled: false
+repair_enabled: false
+diagnostics_enabled: true
+output_dir: "runs/decode_no_tpd"
+
+input_text: "Please contact John Smith at john.smith@company.com or call 555-123-4567."
