@@ -1,0 +1,40 @@
+# Evaluation — CPU small (default for CI and CPU-first users)
+# Designed to complete in minutes on a modern CPU
+
+backend: "synthetic"
+device: "cpu"
+dtype: "auto"
+
+# Decode parameters (conservative for CPU)
+total_steps: 32
+seq_len: 128
+temperature: 1.0
+seed: 42
+
+# Benchmark generation
+num_s1: 30                      # S1: PII redaction samples
+num_s2: 20                      # S2: adversarial extraction
+num_s3: 10                      # S3: derived summaries
+
+# Baselines to run
+baselines:
+  - "B0_unprotected"
+  - "B1_posthoc_redaction"
+  - "B2_ar_logit_mask"
+  - "B3_tpd_projection"
+  - "B4_tpd_projection_schedule"
+  - "B5_tpd_full"
+  # B6 and B7 require FL; run separately via run_fl_cpu.sh
+
+# Leakage patterns
+leakage_patterns:
+  - EMAIL
+  - PHONE
+  - SSN
+  - CC
+  - ID
+
+# Output
+output_dir: "runs/eval_cpu_small"
+save_plots: true
+save_per_sample: true

@@ -1,22 +1,27 @@
 """
 Baseline Implementations — B0 through B7 for the TPD+FL ablation study.
 
-Each baseline function takes a model, input text, and configuration, and
-returns a dict with ``output_text`` and ``metrics``.  The baselines form
-a progression from no protection (B0) to full TPD+FL with typed privacy
-diffusion and federated adapter (B7):
+Each baseline function takes a model backend, a benchmark sample (dict from
+:mod:`tpd_fl.eval.benchgen`), and a configuration object, and returns a
+:class:`BaselineResult` with the output text, timing, and placeholders for
+leakage/utility metrics (filled in by the evaluator).
+
+Baseline progression:
 
   B0  Unprotected         — no privacy mechanism at all.
   B1  Post-hoc redaction  — generate freely, regex-replace after.
   B2  AR logit mask       — autoregressive rolling regex mask (approximate).
-  B3  TPD projection only — apply Π but no schedule or repair.
+  B3  TPD projection only — apply projection but no schedule or repair.
   B4  TPD + schedule      — projection with 3-phase mask schedule.
-  B5  TPD + schedule + repair — full TPD pipeline.
-  B6  TPD + FL            — add federated adapter (type-agnostic).
-  B7  TPD + FL + typed    — full system with typed FL adapter.
+  B5  TPD full            — projection + schedule + verifier + repair.
+  B6  FL only             — FL adapter with NO TPD.  Shows FL alone does not
+                            solve output privacy.
+  B7  TPD + FL            — full system with TPD and FL adapters.
 
-The :class:`BaselineRunner` orchestrates all baselines and collects
-results for evaluation.
+The :class:`BaselineRunner` orchestrates selected baselines across all
+benchmark samples and collects results.
+
+All code is CPU-practical and works with short outputs.
 """
 
 from __future__ import annotations
@@ -53,6 +58,55 @@ _REDACTION_MAP: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\b[A-Z]{1,3}\d{6,10}\b"), "[ID]"),
 ]
 
+# Optional presidio-backed redaction for B1 (fallback to regex if unavailable)
+_PRESIDIO_AVAILABLE = False
+try:
+    from presidio_analyzer import AnalyzerEngine as _AnalyzerEngine
+    from presidio_anonymizer import AnonymizerEngine as _AnonymizerEngine
+    _PRESIDIO_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# BaselineResult
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BaselineResult:
+    """Result container returned by every baseline function.
+
+    The ``output_text`` and ``elapsed_sec`` fields are filled in by the
+    baseline itself.  The leakage and utility fields are placeholders
+    that the evaluator fills in after running leakage and utility checks.
+
+    Attributes
+    ----------
+    name : str
+        Baseline identifier (e.g. "B0_unprotected").
+    output_text : str
+        The text produced by the baseline.
+    elapsed_sec : float
+        Wall-clock time for the baseline run in seconds.
+    hard_leakage_count : int
+        Number of hard (regex) leakage matches.  Filled by evaluator.
+    hard_leakage_rate : float
+        Fraction of secrets leaked (regex).  Filled by evaluator.
+    semantic_leakage : bool
+        Whether any known secret was found via substring matching.
+        Filled by evaluator.
+    utility_score : float
+        Composite utility score.  Filled by evaluator.
+    """
+
+    name: str
+    output_text: str
+    elapsed_sec: float
+    hard_leakage_count: int = 0
+    hard_leakage_rate: float = 0.0
+    semantic_leakage: bool = False
+    utility_score: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Baseline configuration
@@ -61,6 +115,7 @@ _REDACTION_MAP: List[Tuple[re.Pattern, str]] = [
 @dataclass
 class BaselineConfig:
     """Configuration shared across all baselines."""
+
     # Diffusion parameters
     total_steps: int = 64
     seq_len: int = 128
@@ -92,7 +147,11 @@ class BaselineConfig:
 # ---------------------------------------------------------------------------
 
 class _SimpleTokenizer:
-    """Minimal character-level tokenizer for baseline runs."""
+    """Minimal character-level tokenizer for baseline runs.
+
+    Maps each character to its ``ord()`` value (clamped to vocab_size).
+    This is sufficient for CPU-practical evaluation with synthetic backends.
+    """
 
     def __init__(self, vocab_size: int = 32000):
         self._vocab_size = vocab_size
@@ -102,9 +161,11 @@ class _SimpleTokenizer:
         return self._vocab_size
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
+        """Encode text to a list of integer IDs."""
         return [min(ord(c), self._vocab_size - 1) for c in text]
 
     def decode(self, ids) -> str:
+        """Decode a list of integer IDs back to text."""
         chars = []
         for i in ids:
             i = int(i)
@@ -116,6 +177,40 @@ class _SimpleTokenizer:
 
     def __len__(self) -> int:
         return self._vocab_size
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract input text from a benchmark sample
+# ---------------------------------------------------------------------------
+
+def _get_input_text(sample: Dict[str, Any]) -> str:
+    """Extract the input text from a benchmark sample dict.
+
+    Looks for ``source_text`` first (used in S1/S2/S3 samples), then
+    falls back to ``prompt``, then to the sample itself if it is a string.
+    """
+    if isinstance(sample, str):
+        return sample
+    return sample.get("source_text", sample.get("prompt", ""))
+
+
+def _get_known_secrets(sample: Dict[str, Any]) -> List[str]:
+    """Extract the list of known secret values from a benchmark sample.
+
+    Handles both S1 ``embedded_secrets`` and S2 ``target_secrets`` formats.
+    """
+    secrets: List[str] = []
+    for entry in sample.get("embedded_secrets", []):
+        if isinstance(entry, dict) and "value" in entry:
+            secrets.append(entry["value"])
+        elif isinstance(entry, str):
+            secrets.append(entry)
+    for entry in sample.get("target_secrets", []):
+        if isinstance(entry, dict) and "value" in entry:
+            secrets.append(entry["value"])
+        elif isinstance(entry, str):
+            secrets.append(entry)
+    return secrets
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +234,32 @@ def _run_decode_loop(
 ) -> Tuple[str, Dict[str, Any]]:
     """Core decode loop shared by baselines B0 and B3-B7.
 
-    Returns (output_text, metrics_dict).
+    This mirrors the logic in :class:`tpd_fl.diffusion.decode_loop.DiffusionDecodeLoop`
+    but accepts per-component overrides so that each baseline can enable
+    or disable individual hooks.
+
+    Parameters
+    ----------
+    model : DiffusionModel
+        The diffusion language model backend.
+    text : str
+        Input text (may contain PII).
+    config : BaselineConfig
+        Shared configuration.
+    tokenizer : optional tokenizer (defaults to _SimpleTokenizer).
+    projection_engine : optional ProjectionEngine for logit projection.
+    schedule : optional MaskSchedule for phase-gated updates.
+    pos_type : optional pre-computed per-position type list.
+    allowed_masks : optional pre-built allowed-set masks.
+    verifier : optional Verifier for post-step checking.
+    repair_engine : optional RepairEngine for fixing violations.
+    fl_adapter : optional FL adapter with ``adapt_logits`` method.
+    fl_typed : bool — if True, use ``adapt_logits_typed`` on the adapter.
+    tracker : optional SpeedTracker for timing.
+
+    Returns
+    -------
+    (output_text, metrics_dict)
     """
     if tokenizer is None:
         tokenizer = _SimpleTokenizer(model.vocab_size)
@@ -181,8 +301,6 @@ def _run_decode_loop(
     start_time = time.perf_counter()
 
     for t in range(T):
-        step_start = time.perf_counter()
-
         masked = (tokens == model.mask_token_id)
         num_masked = masked.sum().item()
         if num_masked == 0:
@@ -288,15 +406,82 @@ def _run_decode_loop(
 
 
 # ---------------------------------------------------------------------------
+# Helper: build TPD components from config and text
+# ---------------------------------------------------------------------------
+
+def _build_tpd_components(
+    model,
+    text: str,
+    config: BaselineConfig,
+    enable_schedule: bool = False,
+    enable_verifier: bool = False,
+    enable_repair: bool = False,
+) -> Dict[str, Any]:
+    """Build reusable TPD components for baselines B3-B7.
+
+    Returns a dict with keys: tokenizer, proj_engine, pos_type,
+    allowed_masks, schedule, verifier, repair_engine, tracker.
+    """
+    tokenizer = _SimpleTokenizer(model.vocab_size)
+    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
+    allowed_masks = builder.build()
+
+    typer = SpanTyper()
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    seq_len = max(len(token_ids), config.seq_len)
+    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
+    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
+
+    proj_engine = ProjectionEngine(allowed_masks, pos_type)
+
+    schedule = None
+    if enable_schedule:
+        schedule = MaskSchedule(ScheduleConfig(
+            draft_end=config.schedule_draft_end,
+            safe_end=config.schedule_safe_end,
+        ))
+
+    verifier = None
+    if enable_verifier:
+        verifier = Verifier(VerifierConfig(
+            forbidden_tags=config.verifier_forbidden_tags,
+            known_secrets=config.known_secrets,
+        ))
+
+    repair_engine = None
+    if enable_repair:
+        repair_mode = (
+            RepairMode.RESAMPLE
+            if config.repair_mode == "resample"
+            else RepairMode.EDIT
+        )
+        repair_engine = RepairEngine(
+            mode=repair_mode,
+            max_repair_iters=config.repair_max_iters,
+        )
+
+    return {
+        "tokenizer": tokenizer,
+        "proj_engine": proj_engine,
+        "pos_type": pos_type,
+        "allowed_masks": allowed_masks,
+        "schedule": schedule,
+        "verifier": verifier,
+        "repair_engine": repair_engine,
+        "tracker": SpeedTracker(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # B0: Unprotected baseline
 # ---------------------------------------------------------------------------
 
 def B0_unprotected(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
-) -> Dict[str, Any]:
-    """B0 — No protection.  Standard diffusion decode with no privacy hooks.
+) -> BaselineResult:
+    """B0 -- No protection.  Standard diffusion decode with no privacy hooks.
 
     The model generates freely with no projection, schedule, verifier,
     or repair.  This baseline measures the *maximum utility* achievable
@@ -305,64 +490,110 @@ def B0_unprotected(
     Parameters
     ----------
     model : DiffusionModel
-        The diffusion language model.
-    text : str
-        Input text (may contain PII).
+        The diffusion language model backend.
+    sample : dict
+        A benchmark sample from :mod:`tpd_fl.eval.benchgen`.
     config : BaselineConfig, optional.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
+    text = _get_input_text(sample)
     tracker = SpeedTracker()
-    output_text, metrics = _run_decode_loop(
-        model, text, cfg, tracker=tracker,
+
+    start = time.perf_counter()
+    output_text, metrics = _run_decode_loop(model, text, cfg, tracker=tracker)
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B0_unprotected",
+        output_text=output_text,
+        elapsed_sec=elapsed,
     )
-    return {"output_text": output_text, "metrics": metrics}
 
 
 # ---------------------------------------------------------------------------
 # B1: Post-hoc redaction
 # ---------------------------------------------------------------------------
 
-def B1_posthoc_redaction(
-    output_text: str,
-) -> Dict[str, Any]:
-    """B1 — Post-hoc regex redaction.
+def _apply_presidio_redaction(text: str) -> Tuple[str, int]:
+    """Apply presidio-based redaction if available.
 
-    Takes already-generated text and applies regex-based find-and-replace
-    to remove detectable PII patterns.  This is a common "easy" baseline
-    but cannot catch PII that does not match the patterns.
-
-    Parameters
-    ----------
-    output_text : str
-        The raw model output (e.g., from B0).
-
-    Returns
-    -------
-    dict with ``output_text`` (redacted) and ``metrics``.
+    Returns (redacted_text, num_redactions).
     """
-    start = time.perf_counter()
-    redacted = output_text
-    total_redactions = 0
+    analyzer = _AnalyzerEngine()
+    anonymizer = _AnonymizerEngine()
+    results = analyzer.analyze(text=text, language="en")
+    anonymized = anonymizer.anonymize(text=text, analyzer_results=results)
+    return anonymized.text, len(results)
 
+
+def _apply_regex_redaction(text: str) -> Tuple[str, int]:
+    """Apply regex-based redaction as a fallback.
+
+    Returns (redacted_text, num_redactions).
+    """
+    redacted = text
+    total_redactions = 0
     for pat, replacement in _REDACTION_MAP:
         matches = pat.findall(redacted)
         total_redactions += len(matches)
         redacted = pat.sub(replacement, redacted)
+    return redacted, total_redactions
+
+
+def B1_posthoc_redaction(
+    model,
+    sample: Dict[str, Any],
+    config: Optional[BaselineConfig] = None,
+) -> BaselineResult:
+    """B1 -- Post-hoc regex redaction.
+
+    Runs B0 (unprotected decode) first, then applies regex-based
+    find-and-replace to remove detectable PII patterns from the output.
+    Tries to use the ``presidio`` library for more comprehensive NER-based
+    redaction; falls back to simple regex replacement if presidio is not
+    installed.
+
+    Parameters
+    ----------
+    model : DiffusionModel
+        The diffusion language model backend.
+    sample : dict
+        A benchmark sample.
+    config : BaselineConfig, optional.
+
+    Returns
+    -------
+    BaselineResult
+    """
+    cfg = config or BaselineConfig()
+    text = _get_input_text(sample)
+
+    start = time.perf_counter()
+
+    # Step 1: generate unprotected output
+    raw_output, _metrics = _run_decode_loop(model, text, cfg)
+
+    # Step 2: apply redaction
+    if _PRESIDIO_AVAILABLE:
+        try:
+            redacted, num_redactions = _apply_presidio_redaction(raw_output)
+        except Exception:
+            # Fall back to regex if presidio fails at runtime
+            redacted, num_redactions = _apply_regex_redaction(raw_output)
+    else:
+        redacted, num_redactions = _apply_regex_redaction(raw_output)
 
     elapsed = time.perf_counter() - start
 
-    return {
-        "output_text": redacted,
-        "metrics": {
-            "elapsed_sec": elapsed,
-            "total_redactions": total_redactions,
-            "method": "posthoc_regex",
-        },
-    }
+    return BaselineResult(
+        name="B1_posthoc_redaction",
+        output_text=redacted,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,32 +602,33 @@ def B1_posthoc_redaction(
 
 def B2_ar_logit_mask(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
-) -> Dict[str, Any]:
-    """B2 — Autoregressive-style rolling regex logit mask.
+) -> BaselineResult:
+    """B2 -- Autoregressive-style rolling regex logit mask.
 
     Approximates what an AR model would do with a logit mask that
-    prevents generation of PII patterns.  In the diffusion setting,
-    this is approximated by checking the partial output at each step
-    and masking logits that would extend a forbidden pattern.
+    prevents generation of PII patterns.  In the diffusion setting this
+    is approximated by checking the partial output at each step and
+    re-masking positions that form part of a forbidden pattern.
 
-    This is a simplified approximation: at each step, after sampling,
-    we check if the output now contains any forbidden pattern and
-    re-mask those positions for the next step.  Unlike TPD, there is
-    no formal guarantee.
+    For each position, if recently decoded text matches a PII-starting
+    pattern, the tokens at those positions are reset to the mask token
+    so the model must try again.  Unlike TPD, there is no formal
+    guarantee that PII will never appear.
 
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
+    text = _get_input_text(sample)
     tokenizer = _SimpleTokenizer(model.vocab_size)
 
     token_ids = tokenizer.encode(text, add_special_tokens=False)
@@ -459,7 +691,6 @@ def B2_ar_logit_mask(
         decoded = tokenizer.decode(tokens.tolist())
         for _tag, pat in forbidden_pats:
             for m in pat.finditer(decoded):
-                # Re-mask character positions that form the match
                 for ci in range(m.start(), min(m.end(), seq_len)):
                     if tokens[ci] != model.mask_token_id:
                         tokens[ci] = model.mask_token_id
@@ -471,30 +702,23 @@ def B2_ar_logit_mask(
     elapsed = time.perf_counter() - start_time
     output_text = tokenizer.decode(tokens.tolist())
 
-    return {
-        "output_text": output_text,
-        "metrics": {
-            "elapsed_sec": elapsed,
-            "total_steps": T,
-            "tokens_updated": total_updated,
-            "tokens_remasked": total_remasked,
-            "throughput_tok_per_sec": total_updated / max(elapsed, 1e-6),
-            "method": "ar_logit_mask",
-            "speed_summary": tracker.summary(),
-        },
-    }
+    return BaselineResult(
+        name="B2_ar_logit_mask",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
 # B3: TPD projection only
 # ---------------------------------------------------------------------------
 
-def B3_tpd_projection_only(
+def B3_tpd_projection(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
-) -> Dict[str, Any]:
-    """B3 — TPD projection only.  No schedule, no verifier, no repair.
+) -> BaselineResult:
+    """B3 -- TPD projection ONLY.  No schedule, no verifier, no repair.
 
     Applies the support-restriction projection at every step for all
     positions, but does not use the 3-phase schedule or the verifier
@@ -503,37 +727,38 @@ def B3_tpd_projection_only(
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
-    tokenizer = _SimpleTokenizer(model.vocab_size)
-    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
-    allowed_masks = builder.build()
+    text = _get_input_text(sample)
+    components = _build_tpd_components(
+        model, text, cfg,
+        enable_schedule=False,
+        enable_verifier=False,
+        enable_repair=False,
+    )
 
-    typer = SpanTyper()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    seq_len = max(len(token_ids), cfg.seq_len)
-    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
-    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
-
-    proj_engine = ProjectionEngine(allowed_masks, pos_type)
-    tracker = SpeedTracker()
-
+    start = time.perf_counter()
     output_text, metrics = _run_decode_loop(
         model, text, cfg,
-        tokenizer=tokenizer,
-        projection_engine=proj_engine,
-        pos_type=pos_type,
-        allowed_masks=allowed_masks,
-        tracker=tracker,
+        tokenizer=components["tokenizer"],
+        projection_engine=components["proj_engine"],
+        pos_type=components["pos_type"],
+        allowed_masks=components["allowed_masks"],
+        tracker=components["tracker"],
     )
-    metrics["method"] = "tpd_projection_only"
-    return {"output_text": output_text, "metrics": metrics}
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B3_tpd_projection",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -542,278 +767,367 @@ def B3_tpd_projection_only(
 
 def B4_tpd_projection_schedule(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
-) -> Dict[str, Any]:
-    """B4 — TPD with projection and 3-phase mask schedule.
+) -> BaselineResult:
+    """B4 -- TPD with projection and 3-phase mask schedule.
 
-    Adds the DRAFT/SAFE/REVEAL schedule on top of projection.
+    Adds the DRAFT / SAFE / REVEAL schedule on top of projection.
+    Sensitive positions are only updated during the SAFE phase, when
+    the projection engine constrains their output to the allowed set.
     No verifier or repair.
 
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
-    tokenizer = _SimpleTokenizer(model.vocab_size)
-    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
-    allowed_masks = builder.build()
+    text = _get_input_text(sample)
+    components = _build_tpd_components(
+        model, text, cfg,
+        enable_schedule=True,
+        enable_verifier=False,
+        enable_repair=False,
+    )
 
-    typer = SpanTyper()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    seq_len = max(len(token_ids), cfg.seq_len)
-    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
-    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
-
-    proj_engine = ProjectionEngine(allowed_masks, pos_type)
-    schedule = MaskSchedule(ScheduleConfig(
-        draft_end=cfg.schedule_draft_end,
-        safe_end=cfg.schedule_safe_end,
-    ))
-    tracker = SpeedTracker()
-
+    start = time.perf_counter()
     output_text, metrics = _run_decode_loop(
         model, text, cfg,
-        tokenizer=tokenizer,
-        projection_engine=proj_engine,
-        schedule=schedule,
-        pos_type=pos_type,
-        allowed_masks=allowed_masks,
-        tracker=tracker,
+        tokenizer=components["tokenizer"],
+        projection_engine=components["proj_engine"],
+        schedule=components["schedule"],
+        pos_type=components["pos_type"],
+        allowed_masks=components["allowed_masks"],
+        tracker=components["tracker"],
     )
-    metrics["method"] = "tpd_projection_schedule"
-    return {"output_text": output_text, "metrics": metrics}
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B4_tpd_projection_schedule",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
-# B5: TPD projection + schedule + repair
+# B5: TPD full (projection + schedule + verifier + repair)
 # ---------------------------------------------------------------------------
 
-def B5_tpd_schedule_repair(
+def B5_tpd_full(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
-) -> Dict[str, Any]:
-    """B5 — Full TPD pipeline: projection + schedule + verifier + repair.
+) -> BaselineResult:
+    """B5 -- Full TPD pipeline: projection + schedule + verifier + repair.
 
-    This is the complete TPD system without the FL adapter.
+    This is the complete TPD system without the FL adapter.  The verifier
+    checks for forbidden patterns after each step.  If violations are
+    detected, the repair engine re-masks and re-samples the violating
+    positions under projection constraints.
 
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
-    tokenizer = _SimpleTokenizer(model.vocab_size)
-    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
-    allowed_masks = builder.build()
 
-    typer = SpanTyper()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    seq_len = max(len(token_ids), cfg.seq_len)
-    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
-    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
+    # Inject known secrets from the sample into the verifier config
+    secrets = _get_known_secrets(sample)
+    if secrets:
+        cfg = BaselineConfig(
+            total_steps=cfg.total_steps,
+            seq_len=cfg.seq_len,
+            tokens_per_step_frac=cfg.tokens_per_step_frac,
+            temperature=cfg.temperature,
+            seed=cfg.seed,
+            schedule_draft_end=cfg.schedule_draft_end,
+            schedule_safe_end=cfg.schedule_safe_end,
+            repair_mode=cfg.repair_mode,
+            repair_max_iters=cfg.repair_max_iters,
+            verifier_forbidden_tags=list(cfg.verifier_forbidden_tags),
+            known_secrets=secrets,
+            fl_enabled=cfg.fl_enabled,
+            fl_typed=cfg.fl_typed,
+        )
 
-    proj_engine = ProjectionEngine(allowed_masks, pos_type)
-    schedule = MaskSchedule(ScheduleConfig(
-        draft_end=cfg.schedule_draft_end,
-        safe_end=cfg.schedule_safe_end,
-    ))
-    verifier = Verifier(VerifierConfig(
-        forbidden_tags=cfg.verifier_forbidden_tags,
-        known_secrets=cfg.known_secrets,
-    ))
-    repair_mode = RepairMode.RESAMPLE if cfg.repair_mode == "resample" else RepairMode.EDIT
-    repair_engine = RepairEngine(
-        mode=repair_mode,
-        max_repair_iters=cfg.repair_max_iters,
+    text = _get_input_text(sample)
+    components = _build_tpd_components(
+        model, text, cfg,
+        enable_schedule=True,
+        enable_verifier=True,
+        enable_repair=True,
     )
-    tracker = SpeedTracker()
 
+    start = time.perf_counter()
     output_text, metrics = _run_decode_loop(
         model, text, cfg,
-        tokenizer=tokenizer,
-        projection_engine=proj_engine,
-        schedule=schedule,
-        pos_type=pos_type,
-        allowed_masks=allowed_masks,
-        verifier=verifier,
-        repair_engine=repair_engine,
-        tracker=tracker,
+        tokenizer=components["tokenizer"],
+        projection_engine=components["proj_engine"],
+        schedule=components["schedule"],
+        pos_type=components["pos_type"],
+        allowed_masks=components["allowed_masks"],
+        verifier=components["verifier"],
+        repair_engine=components["repair_engine"],
+        tracker=components["tracker"],
     )
-    metrics["method"] = "tpd_schedule_repair"
-    return {"output_text": output_text, "metrics": metrics}
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B5_tpd_full",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
-# B6: TPD + FL (type-agnostic adapter)
+# B6: FL only (no TPD)
 # ---------------------------------------------------------------------------
 
-def B6_tpd_fl(
+def B6_fl_only(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
     fl_adapter=None,
-) -> Dict[str, Any]:
-    """B6 — TPD + federated adapter (type-agnostic).
+) -> BaselineResult:
+    """B6 -- FL adapter applied, but NO TPD.
 
-    Adds a federated learning adapter that modifies logits before
-    projection.  The adapter is type-agnostic: it applies the same
-    transformation regardless of the position's SpanType.
+    Demonstrates that federated learning adapters alone do not solve
+    output privacy.  The FL adapter modifies logits but without
+    projection, schedule, or verifier there is no hard privacy guarantee.
 
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
     fl_adapter : object with ``adapt_logits(logits, t, T)`` method.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
-    tokenizer = _SimpleTokenizer(model.vocab_size)
-    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
-    allowed_masks = builder.build()
-
-    typer = SpanTyper()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    seq_len = max(len(token_ids), cfg.seq_len)
-    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
-    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
-
-    proj_engine = ProjectionEngine(allowed_masks, pos_type)
-    schedule = MaskSchedule(ScheduleConfig(
-        draft_end=cfg.schedule_draft_end,
-        safe_end=cfg.schedule_safe_end,
-    ))
-    verifier = Verifier(VerifierConfig(
-        forbidden_tags=cfg.verifier_forbidden_tags,
-        known_secrets=cfg.known_secrets,
-    ))
-    repair_engine = RepairEngine(
-        mode=RepairMode.RESAMPLE if cfg.repair_mode == "resample" else RepairMode.EDIT,
-        max_repair_iters=cfg.repair_max_iters,
-    )
+    text = _get_input_text(sample)
     tracker = SpeedTracker()
 
+    start = time.perf_counter()
     output_text, metrics = _run_decode_loop(
         model, text, cfg,
-        tokenizer=tokenizer,
-        projection_engine=proj_engine,
-        schedule=schedule,
-        pos_type=pos_type,
-        allowed_masks=allowed_masks,
-        verifier=verifier,
-        repair_engine=repair_engine,
         fl_adapter=fl_adapter,
         fl_typed=False,
         tracker=tracker,
     )
-    metrics["method"] = "tpd_fl"
-    return {"output_text": output_text, "metrics": metrics}
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B6_fl_only",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
 
 
 # ---------------------------------------------------------------------------
-# B7: TPD + FL + typed
+# B7: TPD + FL (full system)
 # ---------------------------------------------------------------------------
 
-def B7_tpd_fl_typed(
+def B7_tpd_fl(
     model,
-    text: str,
+    sample: Dict[str, Any],
     config: Optional[BaselineConfig] = None,
     fl_adapter=None,
-) -> Dict[str, Any]:
-    """B7 — Full TPD+FL system with typed federated adapter.
+) -> BaselineResult:
+    """B7 -- TPD + FL adapters.  Full system.
 
-    The typed adapter uses per-SpanType logit adjustments, enabling
-    finer-grained control (e.g., different behaviour for EMAIL vs PHONE
-    sensitive positions).
+    Combines the complete TPD pipeline (projection + schedule + verifier
+    + repair) with a federated learning adapter.  The FL adapter modifies
+    logits before projection, and the projection enforces the hard
+    privacy guarantee.  If the adapter exposes ``adapt_logits_typed``,
+    the typed variant is used for per-SpanType logit adjustments.
 
     Parameters
     ----------
     model : DiffusionModel
-    text : str
+    sample : dict
     config : BaselineConfig, optional.
-    fl_adapter : object with ``adapt_logits_typed(logits, types, t, T)`` method.
+    fl_adapter : object with ``adapt_logits(logits, t, T)`` or
+        ``adapt_logits_typed(logits, types, t, T)`` method.
 
     Returns
     -------
-    dict with ``output_text`` and ``metrics``.
+    BaselineResult
     """
     cfg = config or BaselineConfig()
-    tokenizer = _SimpleTokenizer(model.vocab_size)
-    builder = AllowedSetBuilder(tokenizer, AllowedSetConfig(), device="cpu")
-    allowed_masks = builder.build()
 
-    typer = SpanTyper()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    seq_len = max(len(token_ids), cfg.seq_len)
-    offset_mapping = [(i, min(i + 1, len(text))) for i in range(seq_len)]
-    _spans, pos_type, _span_ids = typer.type_text(text, offset_mapping, seq_len)
+    # Inject known secrets from the sample into the verifier config
+    secrets = _get_known_secrets(sample)
+    if secrets:
+        cfg = BaselineConfig(
+            total_steps=cfg.total_steps,
+            seq_len=cfg.seq_len,
+            tokens_per_step_frac=cfg.tokens_per_step_frac,
+            temperature=cfg.temperature,
+            seed=cfg.seed,
+            schedule_draft_end=cfg.schedule_draft_end,
+            schedule_safe_end=cfg.schedule_safe_end,
+            repair_mode=cfg.repair_mode,
+            repair_max_iters=cfg.repair_max_iters,
+            verifier_forbidden_tags=list(cfg.verifier_forbidden_tags),
+            known_secrets=secrets,
+            fl_enabled=cfg.fl_enabled,
+            fl_typed=cfg.fl_typed,
+        )
 
-    proj_engine = ProjectionEngine(allowed_masks, pos_type)
-    schedule = MaskSchedule(ScheduleConfig(
-        draft_end=cfg.schedule_draft_end,
-        safe_end=cfg.schedule_safe_end,
-    ))
-    verifier = Verifier(VerifierConfig(
-        forbidden_tags=cfg.verifier_forbidden_tags,
-        known_secrets=cfg.known_secrets,
-    ))
-    repair_engine = RepairEngine(
-        mode=RepairMode.RESAMPLE if cfg.repair_mode == "resample" else RepairMode.EDIT,
-        max_repair_iters=cfg.repair_max_iters,
+    text = _get_input_text(sample)
+    # Determine if the adapter supports typed logits
+    use_typed = (
+        fl_adapter is not None
+        and hasattr(fl_adapter, "adapt_logits_typed")
     )
-    tracker = SpeedTracker()
+    components = _build_tpd_components(
+        model, text, cfg,
+        enable_schedule=True,
+        enable_verifier=True,
+        enable_repair=True,
+    )
 
+    start = time.perf_counter()
     output_text, metrics = _run_decode_loop(
         model, text, cfg,
-        tokenizer=tokenizer,
-        projection_engine=proj_engine,
-        schedule=schedule,
-        pos_type=pos_type,
-        allowed_masks=allowed_masks,
-        verifier=verifier,
-        repair_engine=repair_engine,
+        tokenizer=components["tokenizer"],
+        projection_engine=components["proj_engine"],
+        schedule=components["schedule"],
+        pos_type=components["pos_type"],
+        allowed_masks=components["allowed_masks"],
+        verifier=components["verifier"],
+        repair_engine=components["repair_engine"],
         fl_adapter=fl_adapter,
-        fl_typed=True,
-        tracker=tracker,
+        fl_typed=use_typed,
+        tracker=components["tracker"],
     )
-    metrics["method"] = "tpd_fl_typed"
-    return {"output_text": output_text, "metrics": metrics}
+    elapsed = time.perf_counter() - start
+
+    return BaselineResult(
+        name="B7_tpd_fl",
+        output_text=output_text,
+        elapsed_sec=elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases (for existing __init__.py imports)
+# ---------------------------------------------------------------------------
+
+def B3_tpd_projection_only(
+    model, text: str, config: Optional[BaselineConfig] = None,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper — delegates to B3_tpd_projection.
+
+    Accepts a raw text string instead of a sample dict and returns a
+    dict with ``output_text`` and ``metrics`` keys for compatibility
+    with callers that use the old interface.
+    """
+    sample = {"source_text": text}
+    result = B3_tpd_projection(model, sample, config)
+    return {"output_text": result.output_text, "metrics": {"elapsed_sec": result.elapsed_sec}}
+
+
+def B5_tpd_schedule_repair(
+    model, text: str, config: Optional[BaselineConfig] = None,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper — delegates to B5_tpd_full."""
+    sample = {"source_text": text}
+    result = B5_tpd_full(model, sample, config)
+    return {"output_text": result.output_text, "metrics": {"elapsed_sec": result.elapsed_sec}}
+
+
+def B6_tpd_fl(
+    model, text: str, config: Optional[BaselineConfig] = None,
+    fl_adapter=None,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper — delegates to B6_fl_only."""
+    sample = {"source_text": text}
+    result = B6_fl_only(model, sample, config, fl_adapter)
+    return {"output_text": result.output_text, "metrics": {"elapsed_sec": result.elapsed_sec}}
+
+
+def B7_tpd_fl_typed(
+    model, text: str, config: Optional[BaselineConfig] = None,
+    fl_adapter=None,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper — delegates to B7_tpd_fl."""
+    sample = {"source_text": text}
+    result = B7_tpd_fl(model, sample, config, fl_adapter)
+    return {"output_text": result.output_text, "metrics": {"elapsed_sec": result.elapsed_sec}}
 
 
 # ---------------------------------------------------------------------------
 # BaselineRunner
 # ---------------------------------------------------------------------------
 
+# Registry mapping baseline names to (function, requires_fl_adapter) pairs
+_BASELINE_REGISTRY: Dict[str, Tuple[Callable, bool]] = {
+    "B0": (B0_unprotected, False),
+    "B1": (B1_posthoc_redaction, False),
+    "B2": (B2_ar_logit_mask, False),
+    "B3": (B3_tpd_projection, False),
+    "B4": (B4_tpd_projection_schedule, False),
+    "B5": (B5_tpd_full, False),
+    "B6": (B6_fl_only, True),
+    "B7": (B7_tpd_fl, True),
+}
+
+
 class BaselineRunner:
-    """Orchestrates all baselines and collects results.
+    """Orchestrates all baselines across benchmark samples and collects results.
+
+    The runner iterates over a list of benchmark samples (from
+    :class:`~tpd_fl.eval.benchgen.BenchmarkGenerator`), runs each
+    selected baseline on every sample, and optionally evaluates leakage
+    and utility metrics on each result.
 
     Parameters
     ----------
     model : DiffusionModel
-        The diffusion model to use for all baselines.
+        The diffusion model backend to use for all baselines.
     config : BaselineConfig, optional
-        Shared configuration.
-    fl_adapter : optional FL adapter for B6/B7.
-    leakage_evaluator : optional LeakageEvaluator instance.
-    utility_evaluator : optional UtilityEvaluator instance.
-    reference_text : optional ground-truth reference for utility metrics.
-    reference_secrets : optional list of secrets for leakage evaluation.
+        Shared configuration for all baselines.
+    fl_adapter : optional
+        FL adapter for B6 and B7.  Must expose ``adapt_logits(logits, t, T)``
+        and optionally ``adapt_logits_typed(logits, types, t, T)``.
+    leakage_evaluator : LeakageEvaluator, optional
+        Evaluator for leakage metrics.  If not given, a default instance
+        using :data:`STANDARD_PATTERNS` is created.
+    utility_evaluator : UtilityEvaluator, optional
+        Evaluator for utility metrics.
+
+    Example
+    -------
+    ::
+
+        from tpd_fl.eval.benchgen import BenchmarkGenerator
+        from tpd_fl.eval.baselines import BaselineRunner, BaselineConfig
+        from tpd_fl.diffusion.model_adapter import SyntheticDiffusionModel
+
+        model = SyntheticDiffusionModel()
+        gen = BenchmarkGenerator()
+        samples = gen.generate_s1(num_samples=10)
+
+        runner = BaselineRunner(model)
+        results = runner.run(samples, baseline_names=["B0", "B3", "B5"])
+        for name, result_list in results.items():
+            print(f"{name}: {len(result_list)} results")
     """
 
     def __init__(
@@ -823,107 +1137,187 @@ class BaselineRunner:
         fl_adapter=None,
         leakage_evaluator: Optional[LeakageEvaluator] = None,
         utility_evaluator: Optional[UtilityEvaluator] = None,
-        reference_text: Optional[str] = None,
-        reference_secrets: Optional[List[str]] = None,
     ):
         self.model = model
         self.config = config or BaselineConfig()
         self.fl_adapter = fl_adapter
         self.leakage_eval = leakage_evaluator or LeakageEvaluator()
         self.utility_eval = utility_evaluator or UtilityEvaluator()
-        self.reference_text = reference_text or ""
-        self.reference_secrets = reference_secrets or []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        samples: List[Dict[str, Any]],
+        baseline_names: Optional[List[str]] = None,
+    ) -> Dict[str, List[BaselineResult]]:
+        """Run selected baselines on all samples and collect results.
+
+        Parameters
+        ----------
+        samples : list of dict
+            Benchmark samples from :mod:`tpd_fl.eval.benchgen`.
+        baseline_names : list of str, optional
+            Which baselines to run.  Defaults to all (B0-B7).
+
+        Returns
+        -------
+        Dict mapping baseline name -> list of BaselineResult (one per
+        sample).  Leakage and utility fields are filled in.
+        """
+        names = baseline_names or list(_BASELINE_REGISTRY.keys())
+        results: Dict[str, List[BaselineResult]] = {n: [] for n in names}
+
+        for sample in samples:
+            known_secrets = _get_known_secrets(sample)
+            reference_text = sample.get("source_text", "")
+
+            for name in names:
+                if name not in _BASELINE_REGISTRY:
+                    continue
+
+                fn, needs_fl = _BASELINE_REGISTRY[name]
+
+                # Call the baseline function
+                if needs_fl:
+                    result = fn(
+                        self.model, sample, self.config,
+                        fl_adapter=self.fl_adapter,
+                    )
+                else:
+                    result = fn(self.model, sample, self.config)
+
+                # Evaluate leakage
+                leakage = self.leakage_eval.evaluate(
+                    result.output_text, known_secrets,
+                )
+                result.hard_leakage_count = leakage["hard_leakage_count"]
+                result.hard_leakage_rate = leakage["hard_leakage_rate"]
+                result.semantic_leakage = leakage["semantic_leakage_detected"]
+
+                # Evaluate utility
+                utility = self.utility_eval.evaluate(
+                    result.output_text, reference_text,
+                )
+                result.utility_score = utility.get(
+                    "exact_match_public",
+                    utility.get("rouge", {}).get("rouge1", {}).get("f1", 0.0),
+                )
+
+                results[name].append(result)
+
+        return results
+
+    def run_single(
+        self,
+        sample: Dict[str, Any],
+        baseline_names: Optional[List[str]] = None,
+    ) -> Dict[str, BaselineResult]:
+        """Run selected baselines on a single sample.
+
+        Convenience wrapper around :meth:`run` for single-sample usage.
+
+        Parameters
+        ----------
+        sample : dict
+            A single benchmark sample.
+        baseline_names : list of str, optional.
+
+        Returns
+        -------
+        Dict mapping baseline name -> BaselineResult.
+        """
+        batch_results = self.run([sample], baseline_names=baseline_names)
+        return {name: results[0] for name, results in batch_results.items() if results}
+
+    # ------------------------------------------------------------------
+    # Legacy interface (for backward compatibility with run_eval.py)
+    # ------------------------------------------------------------------
 
     def run_all(
         self,
         text: str,
         baselines: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Run all (or selected) baselines on the given text.
+        """Run all (or selected) baselines on raw text.
+
+        This method preserves backward compatibility with the original
+        ``BaselineRunner.run_all`` interface used by ``run_eval.py``.
 
         Parameters
         ----------
         text : str
             Input text containing PII.
         baselines : list of baseline names, optional.
-            If given, only run these baselines.  Names are "B0" through "B7".
 
         Returns
         -------
-        dict mapping baseline name -> result dict with keys:
-            output_text, metrics, leakage, utility.
+        dict mapping baseline name -> dict with ``output_text``, ``metrics``,
+        ``leakage``, ``utility`` keys.
         """
-        all_baselines = {
-            "B0": self._run_b0,
-            "B1": self._run_b1,
-            "B2": self._run_b2,
-            "B3": self._run_b3,
-            "B4": self._run_b4,
-            "B5": self._run_b5,
-            "B6": self._run_b6,
-            "B7": self._run_b7,
-        }
-
-        to_run = baselines or list(all_baselines.keys())
+        sample = {"source_text": text}
+        names = baselines or list(_BASELINE_REGISTRY.keys())
         results: Dict[str, Dict[str, Any]] = {}
 
-        # B0 needed for B1
-        b0_output = None
-
-        for name in to_run:
-            if name not in all_baselines:
+        for name in names:
+            if name not in _BASELINE_REGISTRY:
                 continue
 
-            if name == "B1":
-                # B1 needs B0 output
-                if b0_output is None:
-                    b0_result = self._run_b0(text)
-                    b0_output = b0_result["output_text"]
-                result = all_baselines[name](text, b0_output=b0_output)
+            fn, needs_fl = _BASELINE_REGISTRY[name]
+            if needs_fl:
+                br = fn(self.model, sample, self.config, fl_adapter=self.fl_adapter)
             else:
-                result = all_baselines[name](text)
+                br = fn(self.model, sample, self.config)
 
-            if name == "B0":
-                b0_output = result["output_text"]
+            leakage = self.leakage_eval.evaluate(br.output_text, [])
+            utility = self.utility_eval.evaluate(br.output_text, text)
 
-            # Evaluate leakage and utility
-            result["leakage"] = self.leakage_eval.evaluate(
-                result["output_text"], self.reference_secrets,
-            )
-            result["utility"] = self.utility_eval.evaluate(
-                result["output_text"], self.reference_text,
-            )
-            results[name] = result
+            results[name] = {
+                "output_text": br.output_text,
+                "metrics": {"elapsed_sec": br.elapsed_sec},
+                "leakage": leakage,
+                "utility": utility,
+            }
 
         return results
 
-    # ------------------------------------------------------------------
-    # Per-baseline runners
-    # ------------------------------------------------------------------
 
-    def _run_b0(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B0_unprotected(self.model, text, self.config)
+# ---------------------------------------------------------------------------
+# Module-level convenience function
+# ---------------------------------------------------------------------------
 
-    def _run_b1(self, text: str, b0_output: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        if b0_output is None:
-            b0_result = B0_unprotected(self.model, text, self.config)
-            b0_output = b0_result["output_text"]
-        return B1_posthoc_redaction(b0_output)
+def run_baselines(
+    backend,
+    samples: List[Dict[str, Any]],
+    baseline_names: Optional[List[str]] = None,
+    config: Optional[BaselineConfig] = None,
+    fl_adapter=None,
+) -> Dict[str, List[BaselineResult]]:
+    """Run baselines on all samples and return collected results.
 
-    def _run_b2(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B2_ar_logit_mask(self.model, text, self.config)
+    This is a module-level convenience function that creates a
+    :class:`BaselineRunner` and delegates to :meth:`BaselineRunner.run`.
 
-    def _run_b3(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B3_tpd_projection_only(self.model, text, self.config)
+    Parameters
+    ----------
+    backend : DiffusionModel
+        The diffusion model backend.
+    samples : list of dict
+        Benchmark samples from :mod:`tpd_fl.eval.benchgen`.
+    baseline_names : list of str, optional
+        Which baselines to run (defaults to all B0-B7).
+    config : BaselineConfig, optional.
+    fl_adapter : optional FL adapter for B6/B7.
 
-    def _run_b4(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B4_tpd_projection_schedule(self.model, text, self.config)
-
-    def _run_b5(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B5_tpd_schedule_repair(self.model, text, self.config)
-
-    def _run_b6(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B6_tpd_fl(self.model, text, self.config, self.fl_adapter)
-
-    def _run_b7(self, text: str, **kwargs) -> Dict[str, Any]:
-        return B7_tpd_fl_typed(self.model, text, self.config, self.fl_adapter)
+    Returns
+    -------
+    Dict mapping baseline name -> list of BaselineResult.
+    """
+    runner = BaselineRunner(
+        model=backend,
+        config=config,
+        fl_adapter=fl_adapter,
+    )
+    return runner.run(samples, baseline_names=baseline_names)

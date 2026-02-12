@@ -1,0 +1,10 @@
+# LLaDA2.1-mini 16B MoE — GPU Tier 2 configuration
+# Requires CUDA GPU with >=32GB VRAM
+# This is the OPTIONAL scaling tier; CPU users should use cpu_llada8b.yaml
+
+model_id: "inclusionAI/LLaDA2.1-mini"
+device: "cuda"
+dtype: "bf16"
+max_seq_len: 512
+trust_remote_code: true
+diffusion_steps: 64

@@ -1,0 +1,20 @@
+# Baseline B4: TPD projection + typed schedule
+backend: "synthetic"
+device: "cpu"
+dtype: "auto"
+total_steps: 32
+seq_len: 128
+tokens_per_step_frac: 0.15
+temperature: 1.0
+seed: 42
+
+schedule_enabled: true
+schedule_draft_end: 0.4
+schedule_safe_end: 0.9
+projection_enabled: true
+verifier_enabled: false
+repair_enabled: false
+diagnostics_enabled: true
+output_dir: "runs/decode_b4"
+
+input_text: "Contact John Smith at john.smith@company.com or call (555) 123-4567. SSN: 123-45-6789."

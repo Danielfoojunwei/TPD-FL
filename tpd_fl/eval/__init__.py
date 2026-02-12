@@ -4,10 +4,12 @@ TPD+FL Evaluation Suite.
 Provides comprehensive evaluation tools for the Typed Privacy Diffusion +
 Federated Learning system:
 
+- **Benchmark generation**: deterministic PII redaction, adversarial
+  extraction, and derived summary benchmarks.
 - **Leakage metrics**: regex-based and semantic leakage detection.
 - **Utility metrics**: exact match, ROUGE, fluency on public content.
 - **Speed metrics**: per-step timing and throughput tracking.
-- **Baselines**: B0 (unprotected) through B7 (full TPD+FL typed).
+- **Baselines**: B0 (unprotected) through B7 (full TPD+FL).
 - **Plots**: matplotlib-based publication-ready figures.
 - **Runner**: CLI-driven evaluation pipeline.
 """
@@ -28,16 +30,24 @@ from tpd_fl.eval.utility import (
 from tpd_fl.eval.speed import SpeedTracker
 from tpd_fl.eval.baselines import (
     BaselineConfig,
+    BaselineResult,
     BaselineRunner,
     B0_unprotected,
     B1_posthoc_redaction,
     B2_ar_logit_mask,
-    B3_tpd_projection_only,
+    B3_tpd_projection,
     B4_tpd_projection_schedule,
+    B5_tpd_full,
+    B6_fl_only,
+    B7_tpd_fl,
+    run_baselines,
+    # Backward-compatible aliases
+    B3_tpd_projection_only,
     B5_tpd_schedule_repair,
-    B6_tpd_fl,
+    B6_tpd_fl as _B6_tpd_fl_compat,
     B7_tpd_fl_typed,
 )
+from tpd_fl.eval.benchgen import BenchmarkGenerator
 from tpd_fl.eval.plots import (
     plot_leakage_bar,
     plot_utility_vs_leakage,
@@ -56,15 +66,25 @@ def __getattr__(name):
 
 
 __all__ = [
+    # Benchmark generation
+    "BenchmarkGenerator",
+    # Leakage
     "regex_leakage_count", "regex_leakage_rate", "quasi_identifier_check",
     "LeakageEvaluator", "STANDARD_PATTERNS",
+    # Utility
     "exact_match_public", "rouge_public", "fluency_metrics", "UtilityEvaluator",
+    # Speed
     "SpeedTracker",
-    "BaselineConfig", "BaselineRunner",
+    # Baselines
+    "BaselineConfig", "BaselineResult", "BaselineRunner", "run_baselines",
     "B0_unprotected", "B1_posthoc_redaction", "B2_ar_logit_mask",
-    "B3_tpd_projection_only", "B4_tpd_projection_schedule",
-    "B5_tpd_schedule_repair", "B6_tpd_fl", "B7_tpd_fl_typed",
+    "B3_tpd_projection", "B4_tpd_projection_schedule",
+    "B5_tpd_full", "B6_fl_only", "B7_tpd_fl",
+    # Backward-compatible aliases
+    "B3_tpd_projection_only", "B5_tpd_schedule_repair", "B7_tpd_fl_typed",
+    # Plots
     "plot_leakage_bar", "plot_utility_vs_leakage", "plot_z_distribution",
     "plot_runtime_vs_utility", "plot_fl_convergence",
+    # Runner (lazy)
     "EvalConfig", "EvalRunner", "load_eval_config",
 ]

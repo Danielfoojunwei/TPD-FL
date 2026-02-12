@@ -1,0 +1,28 @@
+# Baseline B5: Full TPD (projection + schedule + verifier + repair)
+backend: "synthetic"
+device: "cpu"
+dtype: "auto"
+total_steps: 32
+seq_len: 128
+tokens_per_step_frac: 0.15
+temperature: 1.0
+seed: 42
+
+schedule_enabled: true
+schedule_draft_end: 0.4
+schedule_safe_end: 0.9
+projection_enabled: true
+verifier_enabled: true
+verifier_check_every: 4
+verifier_forbidden_tags:
+  - EMAIL
+  - PHONE
+  - SSN
+  - CC
+  - ID
+repair_enabled: true
+repair_mode: "resample"
+diagnostics_enabled: true
+output_dir: "runs/decode_b5"
+
+input_text: "Contact John Smith at john.smith@company.com or call (555) 123-4567. SSN: 123-45-6789."

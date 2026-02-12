@@ -1,0 +1,42 @@
+# Evaluation — GPU full (scale appendix, requires CUDA)
+# Use with LLaDA 8B on GPU or LLaDA2.1-mini
+
+backend: "llada8b"
+model_id: "GSAI-ML/LLaDA-8B-Instruct"
+device: "cuda"
+dtype: "bf16"
+
+total_steps: 64
+seq_len: 512
+temperature: 1.0
+seed: 42
+
+num_s1: 100
+num_s2: 50
+num_s3: 50
+
+baselines:
+  - "B0_unprotected"
+  - "B1_posthoc_redaction"
+  - "B2_ar_logit_mask"
+  - "B3_tpd_projection"
+  - "B4_tpd_projection_schedule"
+  - "B5_tpd_full"
+  - "B6_fl_only"
+  - "B7_tpd_fl"
+
+leakage_patterns:
+  - EMAIL
+  - PHONE
+  - SSN
+  - CC
+  - ID
+
+# FL config for B6/B7
+fl_num_rounds: 10
+fl_num_clients: 8
+fl_lora_rank: 8
+
+output_dir: "runs/eval_gpu_full"
+save_plots: true
+save_per_sample: true
