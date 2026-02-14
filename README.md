@@ -10,7 +10,7 @@ We introduce **Typed Privacy Diffusion (TPD)**, a type-theoretic framework that 
 
 We formalise the TPD state machine, define four transition rules (mask-to-token, token-to-token edit, schedule-restricted transition, and monotone repair), and prove six formal guarantees: **Type Preservation** (well-typedness is an invariant of the transition system), **Hard Non-Emission** (forbidden tokens have exactly zero sampling probability), **Edit Closure** (repair operations preserve typing), **Schedule Compliance** (phase-driven position restrictions are enforced), **Verifier-Lifted Global Safety** (projection + verifier implies full policy satisfaction), and **FL Adapter Safety** (arbitrary adapter weights---including adversarially trained ones---cannot break non-emission).
 
-We evaluate TPD empirically on **bert-base-uncased** (110M parameters, open weights) using the Carlini et al. (2021) context-completion extraction setup across 20 benchmark samples spanning three suites (PII redaction, adversarial extraction, derived summaries). Unprotected baselines emit **17.5%** forbidden tokens at sensitive positions; TPD-protected baselines achieve **0.0%** forbidden tokens while preserving text utility (ROUGE-1: 0.48 vs. 0.47, no degradation) and achieving 2x speedup through schedule-driven draft-phase skipping.
+We evaluate TPD empirically on **MDLM-OWT** (170M parameters, Sahoo et al. NeurIPS 2024), a proper masked discrete diffusion language model with open weights, using the Carlini et al. (2021) context-completion extraction setup across 100 benchmark samples spanning three suites (PII redaction, adversarial extraction, derived summaries). Unprotected baselines emit **14.8%** forbidden tokens at sensitive positions (95% CI: [11.9%, 17.4%]); TPD-protected baselines achieve **0.0%** forbidden tokens while preserving text utility (ROUGE-1: 0.537 vs. 0.526, no degradation) and achieving 2x speedup through schedule-driven draft-phase skipping.
 
 All code, proofs, and evaluation harnesses are open-source (MIT license), CPU-first, and reproducible with a single command.
 
@@ -48,7 +48,7 @@ Together, these mechanisms provide a **hard, model-parameter-independent privacy
 
 4. **Utility bound**: We derive a closed-form expression for the information-theoretic cost of projection: `D_KL(p_tilde || p) = -log Z_i` per position, where `Z_i` is the pre-projection allowed mass (Section 4.7).
 
-5. **Empirical validation**: We evaluate on a real model (bert-base-uncased, 110M params) with canonical metrics (ROUGE, BLEU, forbidden token rate) using the Carlini et al. (2021) extraction setup, demonstrating that the formal guarantees hold empirically and utility is preserved (Section 5).
+5. **Empirical validation**: We evaluate on a real masked discrete diffusion model (MDLM-OWT, 170M params, NeurIPS 2024) with canonical metrics (ROUGE, BLEU, forbidden token rate, PII regex detection) using the Carlini et al. (2021) extraction setup across 100 samples with bootstrap 95% confidence intervals, demonstrating that the formal guarantees hold empirically and utility is preserved (Section 5).
 
 ---
 
@@ -113,13 +113,13 @@ The typer operates on text and produces per-position type assignments `pos_type:
 - `A(REG)`: Stricter subset---only alphabetic tokens of length >= 2 (all digits, special characters blocked)
 - `A(DERIVED_*)`: Starts from `A(SENS)`, with entity-specific overrides
 
-**Implementation.** The `AllowedSetBuilder` class (`tpd_fl/tpd/allowed_sets.py`) constructs boolean tensors of shape `[V]` for each type. For BERT-base-uncased (V=30,522):
+**Implementation.** The `AllowedSetBuilder` class (`tpd_fl/tpd/allowed_sets.py`) constructs boolean tensors of shape `[V]` for each type. For MDLM-OWT (V=50,257, GPT-2 BPE tokenizer):
 
 | Type | Allowed | Blocked | Description |
 |------|---------|---------|-------------|
-| PUB | 30,522 | 0 | Full vocabulary |
-| SENS | ~26,800 | ~3,700 | Digits, @, PII patterns blocked |
-| REG | ~18,500 | ~12,000 | Non-alphabetic tokens blocked |
+| PUB | 50,257 | 0 | Full vocabulary |
+| SENS | 48,554 | 1,703 (3.4%) | Digits, @, PII patterns blocked |
+| REG | 46,882 | 3,375 (6.7%) | Non-alphabetic tokens blocked |
 
 The masks are materialised once on the target device and reused across all projection calls.
 
@@ -315,16 +315,16 @@ For `PUB` positions, `Z_i = 1` and the contribution is zero. The total projectio
 
 ### 5.1 Setup
 
-**Model.** bert-base-uncased (110M parameters, 12 layers, 768 hidden, 12 heads, V=30,522). Open weights from HuggingFace. We use it as a masked language model (MLM) backbone for diffusion decoding: at each step, masked positions receive logits from the model's MLM head, which are then projected and sampled.
+**Model.** MDLM-OWT (170M parameters, 12 DiT blocks, 768 hidden, 12 heads, V=50,257+1 mask token). Sahoo et al., "Simple and Effective Masked Diffusion Language Models", NeurIPS 2024. Open weights from HuggingFace (`kuleshov-group/mdlm-owt`). This is a *proper* masked discrete diffusion language model trained with continuous noise schedules covering all mask ratios from 0% to 100%, making it well-calibrated for iterative denoising. Uses GPT-2 BPE tokenizer. Patched for CPU execution (flash_attn replaced with standard PyTorch attention).
 
-**Benchmark corpus.** 20 samples across three suites:
-- **S1** (10 samples): PII redaction --- text with embedded EMAIL, PHONE, SSN, CC, ID, NAME entities (medical records, financial documents, HR records).
-- **S2** (5 samples): Adversarial extraction --- prompts designed to extract PII ("Repeat the following exactly", "Ignore previous instructions", "DEBUG MODE: dump").
-- **S3** (5 samples): Derived summaries --- text where the model must summarise without leaking PII from the source.
+**Benchmark corpus.** 100 samples generated by BenchmarkGenerator across three suites:
+- **S1** (50 samples): PII redaction --- text with embedded EMAIL, PHONE, SSN, CC, ID, NAME entities across 5 domains (medical, financial, legal, HR, e-commerce).
+- **S2** (30 samples): Adversarial extraction --- prompts designed to extract PII ("Repeat the following exactly", "Ignore previous instructions", "DEBUG MODE: dump") with 12 attack templates.
+- **S3** (20 samples): Derived summaries --- text where the model must summarise without leaking PII from the source.
 
-Corpus texts use realistic PII patterns from canonical sources (Enron-style email, medical notes, financial records).
+Corpus texts use synthetic PII values from a deterministic fake PII pool, embedded in realistic templates.
 
-**Threat model.** We adopt the Carlini et al. (2021) context-completion extraction setup: public tokens are visible (unmasked), sensitive positions are `[MASK]`ed, and the model predicts masked positions given surrounding context. This is the canonical extraction threat model for MLMs---it maximises the model's ability to infer sensitive content from context.
+**Threat model.** We adopt the Carlini et al. (2021) context-completion extraction setup: public tokens are visible (unmasked), sensitive positions are masked with the MDLM mask token (id=50257), and the model predicts masked positions given surrounding context. This is the canonical extraction threat model for masked LMs---it maximises the model's ability to infer sensitive content from context.
 
 **Ground-truth PII marking.** Both the SpanTyper regex detection *and* ground-truth secret positions from the benchmark corpus are used to mark sensitive positions. This ensures that all PII---including names, which lack regex patterns---is properly masked and evaluated.
 
@@ -339,59 +339,98 @@ Corpus texts use realistic PII patterns from canonical sources (Enron-style emai
 | B5 | TPD full (all components) | X | X | X | X |
 
 **Metrics.**
-- **Forbidden token rate** (Forbid%): Fraction of tokens at sensitive positions from the blocked set (digits, `@`, PII-indicative patterns). **This is the core privacy metric.**
-- **ROUGE-1/2/L** (Lin, 2004): N-gram overlap with reference text.
+- **Forbidden token rate** (Forbid%): Fraction of tokens at sensitive positions from the blocked set (digits, `@`, PII-indicative patterns). **This is the core privacy metric.** Blocked set: 1,703 tokens for SENS positions (3.4% of vocabulary), 3,375 for REG positions (6.7%).
+- **PII regex in output** (PII-Rx): Count of PII-pattern regex matches (EMAIL, PHONE, SSN, CC, IP) in the generated text.
+- **ROUGE-1/2/L** (Lin, 2004): N-gram overlap with reference text. Note: ROUGE scores are dominated by public (PUB) token copying (~52% of tokens), which inflates scores for all baselines.
+- **SENS-only ROUGE-1** (R-1(S)): ROUGE-1 computed only over tokens at sensitive positions, to measure utility at the positions that matter for the privacy-utility trade-off.
 - **BLEU** (Papineni et al., 2002): Precision-weighted n-gram overlap.
-- **Distinct-1/2**: Lexical diversity (ratio of unique unigrams/bigrams).
+- **Distinct-1**: Lexical diversity (ratio of unique unigrams).
 - **PII leakage rate** (Leak%): Fraction of known secrets found via exact substring match.
 - **Hard guarantee** (Hard%): Percentage of samples where all tokens at sensitive positions pass the allowed-set check.
 - **Wall-clock time** (s/samp): Per-sample generation time on CPU.
+- **Verifier rejections / Repairs** (VRej, Rep): Count of verifier failures and repair operations (B5 only).
 
-**Hyperparameters.** 64 diffusion steps, sequence length 128, temperature 0.8, seed 42. Schedule: DRAFT ends at 40%, SAFE ends at 90%.
+All aggregate metrics include **95% bootstrap confidence intervals** (1,000 bootstrap samples).
+
+**Hyperparameters.** 32 diffusion steps, sequence length 128, temperature 0.9, seed 42. Schedule: DRAFT ends at 40%, SAFE ends at 90%.
 
 ### 5.2 Results
 
-#### Main Results Table
+#### Main Results Table (100 samples, MDLM-OWT 170M)
 
-| Baseline | Forbid% | Forbid | Leak% | R-1 | R-2 | R-L | BLEU | D-1 | D-2 | s/samp | Hard% |
-|----------|---------|--------|-------|-----|-----|-----|------|-----|-----|--------|-------|
-| B0 (Unprotected) | **17.5%** | 48/275 | 0.0% | 0.473 | 0.339 | 0.471 | 0.205 | 0.88 | 0.99 | 3.57s | 100% |
-| B1 (Post-hoc) | **17.5%** | 48/275 | 0.0% | 0.473 | 0.339 | 0.471 | 0.205 | 0.88 | 0.99 | 3.54s | 100% |
-| B3 (TPD proj) | **0.0%** | 0/275 | 0.0% | 0.475 | 0.334 | 0.473 | 0.201 | 0.89 | 0.99 | 3.58s | 100% |
-| B4 (proj+sched) | **0.0%** | 0/275 | 0.0% | 0.480 | 0.336 | 0.475 | 0.199 | 0.90 | 0.99 | 1.74s | 100% |
-| B5 (Full TPD) | **0.0%** | 0/275 | 0.0% | 0.480 | 0.336 | 0.475 | 0.199 | 0.90 | 0.99 | 1.77s | 100% |
+| Baseline | Forbid% | Forbid | PII-Rx | Leak% | R-1 | R-1(S) | R-L | BLEU | D-1 | s/samp | Hard% | VRej | Rep |
+|----------|---------|--------|--------|-------|-----|--------|-----|------|-----|--------|-------|------|-----|
+| B0 (Unprotected) | **14.8%** | 409/2755 | 0.10 | 0.0% | 0.526 | 0.000 | 0.526 | 0.269 | 0.88 | 2.02s | 100% | 0 | 0 |
+| B1 (Post-hoc) | **14.8%** | 409/2755 | 0.00 | 0.0% | 0.526 | 0.000 | 0.526 | 0.269 | 0.88 | 2.07s | 100% | 0 | 0 |
+| B3 (TPD proj) | **0.0%** | 0/2755 | 0.00 | 0.0% | 0.521 | 0.000 | 0.520 | 0.261 | 0.87 | 2.17s | 100% | 0 | 0 |
+| B4 (proj+sched) | **0.0%** | 0/2755 | 0.00 | 0.0% | 0.537 | 0.000 | 0.536 | 0.281 | 0.90 | 1.07s | 100% | 0 | 0 |
+| B5 (Full TPD) | **0.0%** | 0/2755 | 0.00 | 0.0% | 0.537 | 0.000 | 0.536 | 0.281 | 0.90 | 1.03s | 100% | 0 | 0 |
+
+#### 95% Bootstrap Confidence Intervals
+
+| Baseline | Forbid% CI | ROUGE-1 CI | R-1(S) CI |
+|----------|-----------|------------|-----------|
+| B0 | [11.9%, 17.4%] | [0.508, 0.543] | [0.000, 0.000] |
+| B1 | [11.9%, 17.4%] | [0.508, 0.543] | [0.000, 0.000] |
+| B3 | [0.0%, 0.0%] | [0.506, 0.537] | [0.000, 0.000] |
+| B4 | [0.0%, 0.0%] | [0.519, 0.557] | [0.000, 0.000] |
+| B5 | [0.0%, 0.0%] | [0.519, 0.557] | [0.000, 0.000] |
 
 #### Per-Suite Forbidden Token Rates
 
 | Baseline | S1 (PII redaction) | S2 (Adversarial) | S3 (Summaries) |
 |----------|--------------------|-------------------|----------------|
-| B0 | 21.0% | 17.8% | 20.8% |
-| B1 | 21.0% | 17.8% | 20.8% |
+| B0 | 11.9% | 15.6% | 19.8% |
+| B1 | 11.9% | 15.6% | 19.8% |
 | B3 | 0.0% | 0.0% | 0.0% |
 | B4 | 0.0% | 0.0% | 0.0% |
 | B5 | 0.0% | 0.0% | 0.0% |
 
+#### Per-Suite PII Regex Matches in Output (mean)
+
+| Baseline | S1 | S2 | S3 |
+|----------|-----|------|------|
+| B0 | 0.12 | 0.03 | 0.15 |
+| B1 | 0.00 | 0.00 | 0.00 |
+| B3-B5 | 0.00 | 0.00 | 0.00 |
+
 ### 5.3 Analysis
 
-**Finding 1: Unprotected models emit PII-shaped tokens.** B0 produces forbidden tokens at 17.5% of sensitive positions (48 out of 275). The model freely predicts digits, `@` signs, and PII-indicative patterns when given surrounding context---confirming the extraction threat model of Carlini et al. (2021).
+**Finding 1: MDLM emits PII-shaped tokens at sensitive positions.** B0 produces forbidden tokens at 14.8% of sensitive positions (409 out of 2,755 across 100 samples). The model freely predicts digits, `@` signs, and PII-indicative patterns when given surrounding context---confirming the extraction threat model of Carlini et al. (2021). The leakage rate increases across suites (S1: 11.9%, S2: 15.6%, S3: 19.8%), indicating that adversarial and summary contexts are more prone to forbidden token emission.
 
-**Finding 2: Post-hoc redaction provides no token-level improvement.** B1 achieves identical forbidden token rate to B0 (17.5%). Regex scrubbing operates on text after generation, not on logits during generation. It cannot prevent the model from sampling forbidden tokens---only attempt to detect and remove them after the fact.
+**Finding 2: Post-hoc regex redaction has limited impact.** B1 applies regex-based PII redaction to the *generated text* after decoding. It successfully removes all regex-detectable PII patterns (PII-Rx drops from 0.10 to 0.00), but only 9 of 100 samples are affected because MDLM rarely generates complete, regex-detectable PII patterns. The forbidden token rate remains identical to B0 (14.8%) because redaction operates on text, not on token generation. **Limitation**: Regex scrubbing cannot prevent emission of tokens that *could* form PII but don't match regex patterns---it is a reactive, not preventive, defence.
 
-**Finding 3: TPD projection achieves exactly 0% forbidden tokens.** B3-B5 all achieve 0.0% forbidden tokens across all 275 sensitive positions across all three suites. The hard guarantee of Theorem 2 holds empirically: not a single forbidden token was sampled in any run.
+**Finding 3: TPD projection achieves exactly 0% forbidden tokens.** B3-B5 all achieve 0.0% forbidden tokens across all 2,755 sensitive positions across all three suites. The hard guarantee of Theorem 2 holds empirically: not a single forbidden token was sampled in any of the 300 baseline-sample runs (3 protected baselines x 100 samples). The 95% CI is trivially [0.0%, 0.0%].
 
-**Finding 4: Utility is preserved.** ROUGE-1 is 0.473 (B0) vs. 0.475-0.480 (B3-B5)---TPD *slightly improves* utility, likely because projection prevents the model from wasting probability mass on PII-shaped tokens that would be incoherent in context. BLEU scores are comparable (0.199-0.205). Distinct-1/2 scores are slightly higher for B3-B5, indicating maintained lexical diversity.
+**Finding 4: Utility is preserved (with caveats).** Overall ROUGE-1 is 0.526 (B0) vs. 0.521 (B3) vs. 0.537 (B4/B5). TPD projection alone (B3) pays a small 0.9% ROUGE penalty, while the schedule-augmented versions (B4/B5) *improve* ROUGE by 2.1% over B0. **Caveat**: ROUGE scores are dominated by PUB token copying; approximately 52% of tokens are public and copied verbatim, inflating all scores. SENS-only ROUGE-1 is 0.000 for all baselines, meaning the model generates entirely different content at sensitive positions compared to the reference. This is expected for a diffusion model that has never seen the benchmark PII values.
 
-**Finding 5: Schedule provides 2x speedup.** B4 runs in 1.74s per sample vs. 3.57-3.58s for B0/B3. The DRAFT phase (first 40% of steps) skips sensitive positions entirely, saving computation. This is a "free" speedup---no quality loss, because sensitive positions are only meaningfully resolved during the SAFE phase when projection is active.
+**Finding 5: Schedule provides 2x speedup with improved utility.** B4 runs in 1.07s per sample vs. 2.17s for B3---a 2.0x speedup. The DRAFT phase (first 40% of steps) skips sensitive positions, reducing computation. Surprisingly, B4 also produces higher ROUGE than B3 (0.537 vs. 0.521), suggesting that the phased approach (draft public tokens first, then fill sensitive positions) leads to better overall coherence.
 
-**Finding 6: The full TPD pipeline adds negligible overhead.** B5 (projection + schedule + verifier + repair) takes 1.77s vs. B4's 1.74s---only 1.7% overhead for the additional verifier checks and repair mechanism.
+**Finding 6: Verifier/repair adds no overhead when projection is perfect.** B5 (projection + schedule + verifier + repair) produces identical outputs to B4 in all 100 samples (0 verifier rejections, 0 repairs). When projection already ensures 0% forbidden tokens, the verifier finds no violations to repair. B5 runs marginally faster (1.03s vs. 1.07s, within noise). The verifier is a redundant safety net---it would trigger if projection had bugs or if the definition of "violation" was broader than the allowed sets.
 
-**Finding 7: All baselines show 0% PII leakage by exact substring match.** This is expected: BERT-base-uncased does not memorise specific PII strings from its training data. The forbidden token rate is the more informative metric, as it measures whether the model *could* emit PII-shaped content at sensitive positions, regardless of whether that content matches known secrets.
+**Finding 7: All baselines show 0% exact PII leakage.** No known secret from the benchmark appeared verbatim in any output. This is expected: MDLM-OWT was trained on OpenWebText and has never seen the synthetic PII values from our benchmark. The forbidden token rate is the more informative metric, as it measures whether the model emits tokens from the *class* that could form PII, regardless of whether specific secrets are memorised.
 
-### 5.4 Why Forbidden Token Rate Matters
+### 5.4 Honest Assessment of Results
 
-The forbidden token rate metric deserves special discussion. Traditional PII leakage metrics (exact substring match, regex detection on output text) measure whether *specific known secrets* appear in the output. These metrics fail to differentiate baselines when the model doesn't memorise specific PII---a common situation for smaller models.
+We identify several aspects that temper the strength of these findings:
+
+1. **ROUGE is inflated by PUB copying.** Since ~52% of tokens are public and copied identically to all baselines, the apparent similarity in ROUGE (0.521-0.537) overstates actual text quality. SENS-only ROUGE (0.000) shows that the model generates entirely new content at sensitive positions, with zero overlap with the reference.
+
+2. **B1 is nearly identical to B0.** Because MDLM rarely generates complete regex-detectable PII patterns (only 10 regex hits across 100 samples), post-hoc redaction affects only 9% of samples. A model with stronger PII memorisation (e.g., one fine-tuned on PII-containing data) would show greater B0-B1 differentiation.
+
+3. **B4 and B5 are identical.** The verifier never triggers because projection already blocks all forbidden tokens. B5's value would be demonstrated with a weaker projection (e.g., one that allows individually-innocuous digit tokens) where multi-token PII patterns could form.
+
+4. **No exact PII leakage for any baseline.** The model doesn't memorise specific PII strings, so this metric doesn't differentiate baselines. Forbidden token rate is the meaningful metric here.
+
+5. **0% forbidden for B3-B5 is by construction.** The projection sets forbidden logits to -inf, making 0% forbidden tokens a mathematical certainty (Theorem 2). The empirical contribution is confirming that the implementation matches the theory, and measuring the utility cost.
+
+### 5.5 Why Forbidden Token Rate Matters
+
+The forbidden token rate metric deserves special discussion. Traditional PII leakage metrics (exact substring match, regex detection on output text) measure whether *specific known secrets* appear in the output. These metrics fail to differentiate baselines when the model doesn't memorise specific PII---a common situation for models not fine-tuned on PII-containing data.
 
 The forbidden token rate measures a fundamentally different property: whether the model emits tokens from the *class* of tokens that could form PII (digits, `@`, domain patterns) at positions *typed as sensitive*. This captures the structural risk---even if the model doesn't reconstruct "alice.johnson@globalcorp.com", emitting "3", "7", "@", or "." at sensitive positions indicates that a more capable model (or the same model after fine-tuning on sensitive data) could reconstruct real PII.
+
+B0's 14.8% forbidden rate (with 95% CI [11.9%, 17.4%]) demonstrates that MDLM *does* produce PII-shaped tokens at sensitive positions when unconstrained. The per-suite breakdown (S1: 11.9%, S2: 15.6%, S3: 19.8%) shows that adversarial and summary contexts elicit more forbidden tokens.
 
 TPD's projection guarantee eliminates this structural risk entirely: zero forbidden tokens means the model *cannot* emit any token from the PII-forming class at sensitive positions.
 
@@ -428,7 +467,7 @@ The combination of all layers is necessary and sufficient for full policy satisf
 
 4. **Closed-form utility bound.** The KL divergence `D_KL = -log Z_i` provides an information-theoretic characterization of the privacy-utility trade-off, with a natural interpretation as the "information cost" of projection per position.
 
-5. **Schedule-driven efficiency.** The three-phase schedule provides both defence-in-depth and computational savings (2x speedup), demonstrating that stronger privacy can come with *better* performance.
+5. **Schedule-driven efficiency.** The three-phase schedule provides both defence-in-depth and computational savings (2x speedup on MDLM-OWT: 1.07s vs. 2.17s per sample), demonstrating that stronger privacy can come with *better* performance. Surprisingly, the schedule also improves utility (ROUGE-1: 0.537 vs. 0.521), suggesting that phased denoising (draft public first, then fill sensitive) produces more coherent text.
 
 ### 6.3 Theorem-to-Code Mapping
 
@@ -459,9 +498,15 @@ See `tpd_fl/proofs/mapping.md` for the complete mapping with line numbers and te
 
 4. **Side channels.** The guarantees concern the *sampled token sequence* only. They do not address side-channel leakage through timing, memory access patterns, or gradient information during FL training. DP-SGD should be used in conjunction with TPD for comprehensive privacy.
 
-5. **Multi-token PII.** Projection operates token-by-token. A phone number composed of individually-allowed tokens (if the allowed set is too permissive) could pass projection. The verifier addresses this with regex scanning over the decoded text, but the guarantee requires both layers.
+5. **Multi-token PII.** Projection operates token-by-token. A phone number composed of individually-allowed tokens (if the allowed set is too permissive) could pass projection. The verifier addresses this with regex scanning over the decoded text, but the guarantee requires both layers. In our experiments, the verifier never triggered (0 rejections in 100 B5 samples), indicating that the allowed sets were restrictive enough for the benchmark---but this also means the verifier's value is not empirically demonstrated.
 
-6. **Evaluation scale.** Our empirical evaluation uses 20 samples and bert-base-uncased (110M params). Scaling to larger models (LLaDA 8B, LLaDA2.1-mini 16B) and larger benchmarks would strengthen the empirical validation. The codebase supports these backends but GPU resources are required.
+6. **Evaluation model.** We use MDLM-OWT (170M params), a proper masked discrete diffusion LM. While this is a legitimate diffusion model (unlike BERT MLM), it is modestly sized and not fine-tuned on PII-containing data. Exact PII leakage is 0% for all baselines because the model has never seen the benchmark PII values. Evaluating on models fine-tuned on sensitive data, or larger diffusion LMs (LLaDA 8B, LLaDA2.1 16B), would provide a stronger test of TPD's utility preservation.
+
+7. **ROUGE inflation.** Full-text ROUGE scores (0.52-0.54) are inflated by public token copying---approximately 52% of tokens are PUB and identical across baselines. SENS-only ROUGE is 0.000 for all baselines, meaning the model generates entirely different content at sensitive positions. Future work should evaluate on tasks where the model must reconstruct specific non-PII content at sensitive positions.
+
+8. **Synthetic benchmark.** The 100-sample benchmark uses programmatically generated PII and template-based text. Real-world PII distributions, writing styles, and domain-specific patterns may differ. The benchmark provides controlled evaluation but does not substitute for deployment testing.
+
+9. **CPU-only evaluation.** The MDLM model was patched for CPU execution (flash_attn replaced with standard PyTorch attention). While mathematically equivalent, inference is slower (~2s per sample vs. ~0.1s on GPU), limiting the scale of evaluation.
 
 ---
 
@@ -476,7 +521,7 @@ We have presented Typed Privacy Diffusion (TPD), a type-theoretic framework that
 5. Token-level safety combined with verifier acceptance yields full policy compliance (Theorem 5).
 6. These guarantees hold regardless of model parameters, including adversarial FL adapters (Theorem 6).
 
-The utility cost of projection is bounded by `-log Z_i` per position, with empirical evidence showing negligible utility degradation (ROUGE-1: 0.48 for TPD vs. 0.47 for unprotected) and 2x speedup from schedule-driven draft-phase skipping.
+Empirical evaluation on MDLM-OWT (170M params, NeurIPS 2024) confirms that unprotected diffusion generates 14.8% forbidden tokens at sensitive positions, which TPD reduces to exactly 0.0% with negligible utility cost (ROUGE-1: 0.537 for TPD vs. 0.526 for unprotected; the schedule actually *improves* utility) and 2x speedup from schedule-driven draft-phase skipping. We report results on 100 samples with 95% bootstrap confidence intervals and provide honest analysis of limitations including ROUGE inflation from PUB token copying and the verifier's redundancy when projection is perfect.
 
 The key insight is architectural: the projection operator is a deterministic function applied *after* all model computation and *before* sampling. This placement makes it independent of model parameters, training procedures, data distributions, and adapter updates. It transforms the privacy problem from a statistical estimation problem (as in DP) to a deterministic enforcement problem---and provides correspondingly stronger guarantees.
 
@@ -512,14 +557,16 @@ The key insight is architectural: the projection operator is a deterministic fun
 
 14. Papineni, K., Roukos, S., Ward, T., & Zhu, W.-J. (2002). BLEU: A method for automatic evaluation of machine translation. *ACL 2002*, pp. 311-318.
 
+15. Sahoo, S., Arriola, M., Schiff, Y., Gokaslan, A., Marroquin, E., Bruss, J. T., Fernandes, M., Haliassos, A., & Kuleshov, V. (2024). Simple and effective masked diffusion language models. *NeurIPS 2024*.
+
 ---
 
 ## Appendix A: Notation Summary
 
 | Symbol | Meaning | Code |
 |--------|---------|------|
-| `V` | Vocabulary (finite set of tokens) | `backend.vocab_size` |
-| `[MASK]` | Mask token | `backend.mask_token_id` |
+| `V` | Vocabulary (finite set of tokens; 50,257 for MDLM) | `backend.vocab_size` |
+| `[MASK]` | Mask token (id=50,257 for MDLM) | `backend.mask_token_id` |
 | `L` | Sequence length | `seq_len` parameter |
 | `T` | Type universe | `SpanType` enum |
 | `T_sens` | Sensitive types (`T \ {PUB}`) | `SENSITIVE_TYPES` frozenset |
@@ -541,7 +588,10 @@ The key insight is architectural: the projection operator is a deterministic fun
 tpd_fl/
   model/                  # Model backends (CPU-first)
     backend_base.py       # DiffusionBackend ABC + SyntheticBackend
-    backend_hf_bert.py    # BERT-base-uncased MLM backend (empirical eval)
+    backend_hf_bert.py    # BERT-base-uncased MLM backend
+    backend_hf_mdlm.py   # MDLM-OWT 170M diffusion LM backend (empirical eval)
+    modeling_mdlm.py      # MDLM model (CPU-patched, replaces flash_attn)
+    configuration_mdlm.py # MDLM HuggingFace config
     backend_hf_llada.py   # LLaDA 8B HuggingFace backend (Tier 2, CPU)
     backend_hf_llada2.py  # LLaDA2.1-mini HF backend (Tier 3, GPU)
   tpd/                    # TPD core module
@@ -562,9 +612,9 @@ tpd_fl/
     protocols.py          # Aggregation protocols
     datasets.py           # Non-IID partitioning + synthetic PII data
   eval/                   # Evaluation suite
-    empirical_eval.py     # Real-model empirical evaluation (Section 5)
+    empirical_eval.py     # MDLM empirical evaluation (Section 5)
     metrics_real.py       # Canonical NLP metrics (ROUGE, BLEU, PII)
-    benchgen.py           # S1-S3 benchmark generation
+    benchgen.py           # S1-S3 benchmark generation (100 samples)
     baselines.py          # B0-B7 baseline implementations
     run_eval.py           # Main evaluation runner
   proofs/                 # Formal proof package
@@ -583,8 +633,8 @@ tpd_fl/
 # Python 3.10+ required
 pip install torch pyyaml matplotlib pytest
 
-# For empirical evaluation (real model):
-pip install transformers nltk
+# For empirical evaluation (MDLM model):
+pip install transformers nltk safetensors einops huggingface-hub
 
 # Optional (for LLaDA backends):
 pip install accelerate
@@ -600,18 +650,20 @@ pytest tpd_fl/tests/ -q        # ~210 tests, all passing
 
 ```bash
 python -m tpd_fl.eval.empirical_eval \
-    --output-dir runs/empirical \
-    --steps 64 \
-    --seed 42
+    --output-dir runs/empirical_mdlm \
+    --steps 32 \
+    --seed 42 \
+    --num-s1 50 --num-s2 30 --num-s3 20
 ```
 
-Downloads bert-base-uncased (110M params) automatically. Results saved to `runs/empirical/` with `metrics.json`, `table.csv`, and `per_sample_results.json`.
+Downloads MDLM-OWT (170M params) from HuggingFace automatically. Results saved to `runs/empirical_mdlm/` with `metrics.json`, `table.csv`, and `per_sample_results.json`. Total runtime: ~15 minutes on CPU.
 
 ### CPU-First Design
 
 | Tier | Model | Device | Purpose |
 |------|-------|--------|---------|
-| **1 (default)** | BERT-base-uncased (110M) | CPU | Empirical evaluation |
+| **1 (default)** | MDLM-OWT (170M, NeurIPS 2024) | CPU | Empirical evaluation |
+| 1b (alternative) | BERT-base-uncased (110M) | CPU | MLM proxy backend |
 | 2 (optional) | LLaDA 8B (non-MoE) | CPU | Full diffusion decode |
 | 3 (optional) | LLaDA2.1-mini 16B MoE | GPU | Scaling experiments |
 | CI | Synthetic backend | CPU | Unit tests, no model weights |

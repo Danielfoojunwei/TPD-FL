@@ -322,23 +322,31 @@ class EvalResult:
     exact_leaks: int = 0
     exact_leak_rate: float = 0.0
     regex_hits: int = 0
+    regex_pii_in_output: int = 0  # PII-pattern regex matches in output
     leaked_secrets: List[str] = field(default_factory=list)
     # Forbidden token emission (core TPD metric)
     n_sens_positions: int = 0
     n_forbidden_emitted: int = 0
     forbidden_token_rate: float = 0.0
-    # Utility
+    # Utility — full text
     rouge1_f1: float = 0.0
     rouge2_f1: float = 0.0
     rougeL_f1: float = 0.0
     bleu: float = 0.0
     public_rouge1_f1: float = 0.0
+    # Utility — sensitive positions only (not dominated by PUB tokens)
+    sens_rouge1_f1: float = 0.0
+    sens_text_hyp: str = ""
+    sens_text_ref: str = ""
     # Fluency
     distinct_1: float = 0.0
     distinct_2: float = 0.0
     repetition_ratio: float = 0.0
     # Guarantee
     hard_guarantee_holds: bool = True
+    # Verifier/repair tracking (B5)
+    verifier_rejections: int = 0
+    repair_count: int = 0
 
 
 def evaluate_sample(
@@ -352,6 +360,10 @@ def evaluate_sample(
     hard_guarantee_holds: bool = True,
     n_sens_positions: int = 0,
     n_forbidden_emitted: int = 0,
+    sens_text_hyp: str = "",
+    sens_text_ref: str = "",
+    verifier_rejections: int = 0,
+    repair_count: int = 0,
 ) -> EvalResult:
     """Run full evaluation on a single generated sample."""
     leak = detect_pii_leakage(output_text, known_secrets)
@@ -363,6 +375,15 @@ def evaluate_sample(
         if n_sens_positions > 0 else 0.0
     )
 
+    # SENS-only ROUGE: compare only what was generated at sensitive positions
+    sens_r1 = 0.0
+    if sens_text_hyp and sens_text_ref:
+        sr = rouge_n(sens_text_hyp, sens_text_ref, n=1)
+        sens_r1 = sr["f1"]
+
+    # Count PII regex matches in output (not just known secrets)
+    regex_pii_count = leak["total_regex_hits"]
+
     return EvalResult(
         baseline=baseline,
         sample_id=sample_id,
@@ -372,6 +393,7 @@ def evaluate_sample(
         exact_leaks=leak["exact_leaks"],
         exact_leak_rate=leak["exact_leak_rate"],
         regex_hits=leak["total_regex_hits"],
+        regex_pii_in_output=regex_pii_count,
         leaked_secrets=leak["leaked_secrets"],
         n_sens_positions=n_sens_positions,
         n_forbidden_emitted=n_forbidden_emitted,
@@ -381,8 +403,13 @@ def evaluate_sample(
         rougeL_f1=util["rougeL"]["f1"],
         bleu=util["bleu"],
         public_rouge1_f1=util["public_rouge1_f1"],
+        sens_rouge1_f1=sens_r1,
+        sens_text_hyp=sens_text_hyp,
+        sens_text_ref=sens_text_ref,
         distinct_1=fluency["distinct_1"],
         distinct_2=fluency["distinct_2"],
         repetition_ratio=fluency["repetition_ratio"],
         hard_guarantee_holds=hard_guarantee_holds,
+        verifier_rejections=verifier_rejections,
+        repair_count=repair_count,
     )
