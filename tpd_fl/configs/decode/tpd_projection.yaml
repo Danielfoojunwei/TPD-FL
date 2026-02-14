@@ -1,0 +1,19 @@
+# Baseline B3: TPD projection only (no schedule, no verifier, no repair)
+backend: "synthetic"
+device: "cpu"
+dtype: "auto"
+total_steps: 32
+seq_len: 128
+tokens_per_step_frac: 0.15
+temperature: 1.0
+seed: 42
+
+# Only projection enabled
+schedule_enabled: false
+projection_enabled: true
+verifier_enabled: false
+repair_enabled: false
+diagnostics_enabled: true
+output_dir: "runs/decode_b3"
+
+input_text: "Contact John Smith at john.smith@company.com or call (555) 123-4567. SSN: 123-45-6789."

@@ -1,0 +1,32 @@
+# FL FedAvg — CPU configuration (small, feasible on CPU)
+num_rounds: 5
+min_clients: 3
+strategy: "fedavg"
+
+# Model (synthetic for CI; override to llada8b for real runs)
+backend: "synthetic"
+device: "cpu"
+vocab_size: 512
+
+# LoRA
+lora_rank: 4
+lora_alpha: 8.0
+lora_dropout: 0.0
+target_modules: ["fc1", "fc2"]
+
+# Client training
+local_epochs: 2
+learning_rate: 0.001
+batch_size: 4
+typed_training: false
+
+# Data
+num_clients: 5
+domain_skew: 0.8
+seed: 42
+
+# TPD (applied during evaluation, not training)
+projection_enabled: true
+verifier_enabled: true
+
+output_dir: "runs/fl_fedavg_cpu"

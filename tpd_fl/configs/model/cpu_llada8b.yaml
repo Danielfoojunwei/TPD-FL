@@ -1,0 +1,10 @@
+# LLaDA 8B — CPU-first Tier 1 configuration
+# Expects ~16GB RAM (fp32) or ~8GB (bf16 on supported CPUs)
+# Typical: minutes per request on a modern workstation
+
+model_id: "GSAI-ML/LLaDA-8B-Instruct"
+device: "cpu"
+dtype: "auto"                   # auto-detects bf16 support
+max_seq_len: 256                # keep short for CPU
+trust_remote_code: true
+diffusion_steps: 32             # fewer steps for CPU feasibility

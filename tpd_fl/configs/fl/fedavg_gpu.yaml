@@ -1,0 +1,28 @@
+# FL FedAvg — GPU configuration (larger scale, requires CUDA)
+num_rounds: 20
+min_clients: 5
+strategy: "fedavg"
+
+backend: "llada8b"
+model_id: "GSAI-ML/LLaDA-8B-Instruct"
+device: "cuda"
+dtype: "bf16"
+
+lora_rank: 8
+lora_alpha: 16.0
+lora_dropout: 0.0
+target_modules: ["q_proj", "v_proj"]
+
+local_epochs: 3
+learning_rate: 0.001
+batch_size: 4
+typed_training: true
+
+num_clients: 8
+domain_skew: 0.8
+seed: 42
+
+projection_enabled: true
+verifier_enabled: true
+
+output_dir: "runs/fl_fedavg_gpu"
